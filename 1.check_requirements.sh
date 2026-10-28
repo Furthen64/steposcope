@@ -33,6 +33,6 @@ printf 'This downloads dependencies and creates or updates .venv in this directo
 printf 'uv may also download Python and use its shared cache outside this directory.\n'
 printf 'Allow approximately 1.5 GB of disk space.\n\n'
 printf 'Then start Steposcope with:\n\n'
-printf '  ./runwl.sh\n\n'
-printf 'To open a file directly: ./runwl.sh path/to/model.step\n'
+printf '  ./launch.sh\n\n'
+printf 'To open a file directly: ./launch.sh path/to/model.step\n'
 printf 'See LINUX_README.md for Linux setup and troubleshooting.\n'
