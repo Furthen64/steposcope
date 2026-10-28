@@ -7,7 +7,7 @@ cd "$PROJECT_DIR"
 # The current Python QVTKRenderWindowInteractor uses an X11-native surface.
 # Running Qt through XWayland avoids BadWindow errors in Wayland sessions.
 # Override when testing a native Qt Wayland backend:
-#   QT_QPA_PLATFORM=wayland ./runwl.sh
+#   QT_QPA_PLATFORM=wayland ./launch.sh
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 
 exec uv run steposcope "$@"

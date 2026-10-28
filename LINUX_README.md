@@ -23,17 +23,17 @@ git clone https://github.com/Furthen64/STEPoscope.git
 cd STEPoscope
 ./1.check_requirements.sh      # sanity check (optional but useful)
 uv sync             # ~1.4 GB: Qt + VTK + NumPy and friends
-./runwl.sh          # GUI opens
+./launch.sh          # GUI opens
 ```
 
-`./runwl.sh` forces the X11 platform backend (`QT_QPA_PLATFORM=xcb`) because
+`./launch.sh` forces the X11 platform backend (`QT_QPA_PLATFORM=xcb`) because
 the VTK widget is happiest under XWayland; that is what you want on both
 X11 sessions and modern Wayland desktops (GNOME/KDE).
 
 Open a starter model right away:
 
 ```bash
-./runwl.sh corpus/planar_only/box125.step
+./launch.sh corpus/planar_only/box125.step
 ```
 
 Then work your way through `corpus/`: each subfolder (see
@@ -42,7 +42,7 @@ B-spline lofts, non-manifold bodies, broken models.
 
 ## Known issues on Linux
 
-- **Wayland native sessions**: run via `./runwl.sh` (XWayland). Forcing
+- **Wayland native sessions**: run via `./launch.sh` (XWayland). Forcing
   `QT_QPA_PLATFORM=wayland` directly is not recommended — the VTK
   `QVTKRenderWindowInteractor` still expects an X11 surface and can hit
   BadWindow crashes.
@@ -53,7 +53,7 @@ B-spline lofts, non-manifold bodies, broken models.
   uv run steposcope render model.step --out reports   # PNG render, no GUI
   ```
 - **NVIDIA + Wayland**: if the window opens black, `export __GLX_VENDOR_LIBRARY_NAME=`
-  collision is the usual suspect — running under `./runwl.sh` (XWayland) sidesteps it.
+  collision is the usual suspect — running under `./launch.sh` (XWayland) sidesteps it.
 - The `.sh` process launchers in `headless/` are bash-only. Windows users use
   the two commands documented in [WINDOWS_README.md](WINDOWS_README.md).
 
@@ -61,7 +61,7 @@ B-spline lofts, non-manifold bodies, broken models.
 
 Once the GUI is up, three things to try first:
 
-1. **Playback**: `./runwl.sh corpus/complex_bspline/slotfillet3.step` — watch
+1. **Playback**: `./launch.sh corpus/complex_bspline/slotfillet3.step` — watch
    how surface information unfolds one entity at a time; Play can pause/scrub,
    Turbo goes entity-batch-speed.
 2. **Regenerate a knowledge base**: open `corpus/BROKEN_examples/...` files

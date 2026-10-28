@@ -7,13 +7,13 @@ A STEP file microscope. Explore, visualize, and debug STEP geometry through step
 ```bash
 ./1.check_requirements.sh      # Verify your system has what's needed
 uv sync             # Install all dependencies automatically
-./runwl.sh          # Launch the application
+./launch.sh          # Launch the application
 ```
 
 To open a specific STEP file:
 
 ```bash
-./runwl.sh path/to/model.step
+./launch.sh path/to/model.step
 ```
 
 On Windows, use PowerShell from the repository directory:
