@@ -1,0 +1,12 @@
+{
+  "interval": 5,
+  "views": ["iso", "front", "top", "iso-above-left", "iso-below-left"],
+  "width": 1280,
+  "height": 960,
+  "out_root": "output",
+  "max_snapshots": 0,
+  "show_arrows": true,
+  "show_points": false,
+  "caption": true,
+  "confirm_above": 200
+}

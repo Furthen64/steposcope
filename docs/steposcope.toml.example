@@ -1,0 +1,18 @@
+# Copy this file to steposcope.toml (or ~/.config/steposcope/config.toml).
+# Reverse either orbit drag direction independently.
+invert_mouse_horizontal = false
+invert_mouse_vertical = false
+# Refit the camera after every playback update. Turn this off to keep a
+# hand-positioned view while stepping or playing.
+autozoom = true
+# Show colored XYZ axes rooted at the world origin (0, 0, 0).
+show_xyz_origin = true
+# Show the world XY grid, including before a STEP file is loaded.
+show_xy_grid = true
+# Show #entity labels next to points, edges, and faces.
+show_entity_labels = false
+# Label content: "index" shows #entity IDs; "type" shows Vertex, Edge, Face, etc.
+label_mode = "index"
+# Maximum number of screen-space labels kept visible at once. Selected entities
+# are always preferred; older labels fade and yield to newer labels.
+max_entity_labels = 250

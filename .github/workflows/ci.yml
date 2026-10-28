@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install system libraries for Qt and VTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: Static checks (pyflakes)
+        run: uv run pyflakes step_explorer tests
+
+      - name: Unit tests
+        run: uv run pytest -m "not slow"
+
+      - name: Corpus sweeps
+        run: uv run pytest -m slow
+
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: Check PowerShell launcher
+        run: .\winlaunch.ps1 render --help
+
+      - name: Parser and playback smoke tests
+        run: uv run pytest tests/test_parser.py tests/test_playback_listing.py -q
