@@ -2259,9 +2259,17 @@ class MainWindow(QMainWindow):
             self.tree.blockSignals(was_blocked)
 
     def _viewport_face_double_clicked(self, entity_id: int):
-        if self.document is None or self.document.entity(entity_id) is None:
+        if self.document is None:
+            return
+        entity = self.document.entity(entity_id)
+        if entity is None or entity.type_name.upper() != "ADVANCED_FACE":
             return
         self._viewport_face_picked(entity_id)
+        if self.analyzed_face_id == entity_id:
+            self._exit_face_analysis()
+            return
+        self._analyze_current_face()
+        self.viewport.fit_analysis_face()
         self.details_tabs.setCurrentIndex(0)
         if self.details_tabs.isHidden():
             self._toggle_interpretation_panel()

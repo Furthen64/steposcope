@@ -50,12 +50,14 @@ def test_preview_notes_share_the_compact_warning(qapp, monkeypatch):
     window.close()
 
 
-def test_double_click_face_opens_interpretation_details(qapp):
+def test_double_click_face_opens_interpretation_details(qapp, monkeypatch):
     window = MainWindow()
     example = Path(__file__).resolve().parents[1] / "tests/corpus/planar_only/box125.step"
     window.open_path(str(example))
     window._set_playback_order(len(window.document.entities) - 1)
     face_id = window.current_snapshot.faces[0].entity_id
+    fitted = []
+    monkeypatch.setattr(window.viewport, "fit_analysis_face", lambda: fitted.append(window.analyzed_face_id))
     assert window.details_tabs.isHidden()
 
     window.viewport.face_double_clicked.emit(face_id)
@@ -63,7 +65,11 @@ def test_double_click_face_opens_interpretation_details(qapp):
     assert not window.details_tabs.isHidden()
     assert window.details_tabs.currentWidget().findChild(type(window.details)) is window.details
     assert window.current_id == face_id
+    assert window.analyzed_face_id == face_id
+    assert fitted == [face_id]
     assert f"Entity #{face_id}" in window.details.toPlainText()
     window.viewport.face_double_clicked.emit(face_id)
+    assert window.analyzed_face_id is None
+    assert fitted == [face_id]
     assert not window.details_tabs.isHidden()
     window.close()
