@@ -47,7 +47,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QHBoxLayout,
     QSlider,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
