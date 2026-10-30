@@ -1,5 +1,6 @@
 """Understand a useful, deliberately small subset of STEP geometry/topology."""
 
+from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from itertools import permutations
 import math
@@ -19,12 +20,62 @@ class Point3:
     z: float
 
 
+def _cox_de_boor_basis(parameter, degree, knots, count):
+    """Basis-window Cox–de Boor recursion, equivalent to the full-vector form.
+
+    The full-vector implementation ran over all ``count + degree`` initial
+    spans on every call, so a 24 MB file with ~15 million evaluations spent
+    minutes recomputing basis entries that are exactly zero.  Restricting the
+    recursion to the nonzero window around the parameter's knot span keeps
+    every returned value numerically identical and reduces per-call work from
+    O(count * degree) to O(degree^2).
+    """
+
+    if parameter >= knots[count]:
+        return [0.0] * (count - 1) + [1.0]
+    span = bisect_right(knots, parameter) - 1
+    if span < 0:
+        return [0.0] * count
+    values = [1.0]
+    for level in range(1, degree + 1):
+        window = []
+        for position in range(level + 1):
+            index = span - level + position
+            total = 0.0
+            if position > 0:
+                denominator = knots[index + level] - knots[index]
+                if denominator > 0.0:
+                    total += (parameter - knots[index]) * values[position - 1] / denominator
+            if position < level:
+                denominator = knots[index + level + 1] - knots[index + 1]
+                if denominator > 0.0:
+                    total += (knots[index + level + 1] - parameter) * values[position] / denominator
+            window.append(total)
+        values = window
+    result = [0.0] * count
+    offset = span - degree
+    low = max(0, -offset)
+    high = min(degree + 1, count - offset)
+    if high > low:
+        result[offset + low:offset + high] = values[low:high]
+    return result
+
+
 class _RationalSplineSurface:
     """Small validated tensor-product NURBS evaluator for trimmed STEP faces."""
 
     def __init__(self, controls, weights, degrees, knots, *, self_intersect=False):
         self.controls = controls
         self.weights = weights
+        # Flat (x, y, z, weight) tuples per control row, so evaluate() avoids
+        # touching dataclass attributes for every contributing control point.
+        self.rows_xyzw = tuple(
+            tuple(
+                (point.x, point.y, point.z, weight)
+                for point, weight in zip(row, weight_row)
+            )
+            for row, weight_row in zip(controls, weights)
+        )
         self.degrees = degrees
         self.knots = knots
         self.self_intersect = self_intersect
@@ -50,20 +101,53 @@ class _RationalSplineSurface:
 
     @staticmethod
     def _basis(parameter, degree, knots, count):
+        return _cox_de_boor_basis(parameter, degree, knots, count)
+
+    def _basis_and_span(self, axis, parameter):
+        """Full basis vector plus its nonzero-window span index for one axis."""
+        degree = self.degrees[axis]
+        knots = self.knots[axis]
+        count = len(self.controls) if axis == 0 else len(self.controls[0])
+        basis = _cox_de_boor_basis(parameter, degree, knots, count)
         if parameter >= knots[count]:
-            return [0.0] * (count - 1) + [1.0]
-        values = [1.0 if knots[i] <= parameter < knots[i + 1] else 0.0
-                  for i in range(count + degree)]
-        for level in range(1, degree + 1):
-            values = [
-                ((parameter - knots[i]) * values[i] / (knots[i + level] - knots[i])
-                 if knots[i + level] > knots[i] else 0.0)
-                + ((knots[i + level + 1] - parameter) * values[i + 1]
-                   / (knots[i + level + 1] - knots[i + 1])
-                   if knots[i + level + 1] > knots[i + 1] else 0.0)
-                for i in range(count + degree - level)
-            ]
-        return values[:count]
+            return basis, count - 1
+        span = bisect_right(knots, parameter) - 1
+        if span < 0:
+            return basis, span
+        return basis, min(span, count - 1)
+
+    def _weighted_point(self, u_basis, u_span, v_basis, v_span):
+        # Only the nonzero window around each parameter's knot span can
+        # contribute; iterating the whole control grid per evaluation dominated
+        # the profile on B-spline-heavy files such as AL39.  Clamping the span
+        # keeps the clamped domain end on the last control point exactly as
+        # the full-vector basis does.
+        u_start = max(u_span - self.degrees[0], 0)
+        u_stop = min(u_span + 1, len(self.controls))
+        v_start = max(v_span - self.degrees[1], 0)
+        v_stop = min(v_span + 1, len(self.controls[0]))
+        denominator = 0.0
+        x_sum = y_sum = z_sum = 0.0
+        for i in range(u_start, u_stop):
+            u_value = u_basis[i]
+            if u_value == 0:
+                continue
+            row = self.rows_xyzw[i]
+            for j in range(v_start, v_stop):
+                v_value = v_basis[j]
+                if v_value == 0:
+                    continue
+                weight = u_value * v_value * row[j][3]
+                if weight == 0.0:
+                    continue
+                point = row[j]
+                denominator += weight
+                x_sum += weight * point[0]
+                y_sum += weight * point[1]
+                z_sum += weight * point[2]
+        if denominator <= 0:
+            return None
+        return Point3(x_sum / denominator, y_sum / denominator, z_sum / denominator)
 
     def evaluate(self, u, v):
         if self.periodic[0] and not self.u_range[0] <= u <= self.u_range[1]:
@@ -72,38 +156,27 @@ class _RationalSplineSurface:
             v = self.v_range[0] + (v - self.v_range[0]) % (self.v_range[1] - self.v_range[0])
         u = max(self.u_range[0], min(self.u_range[1], u))
         v = max(self.v_range[0], min(self.v_range[1], v))
-        ub = self._basis(u, self.degrees[0], self.knots[0], len(self.controls))
-        vb = self._basis(v, self.degrees[1], self.knots[1], len(self.controls[0]))
-        xyz = [0.0, 0.0, 0.0]
-        denominator = 0.0
-        for i, u_value in enumerate(ub):
-            if u_value == 0:
-                continue
-            for j, v_value in enumerate(vb):
-                if v_value == 0:
-                    continue
-                weight = u_value * v_value * self.weights[i][j]
-                point = self.controls[i][j]
-                denominator += weight
-                xyz[0] += weight * point.x
-                xyz[1] += weight * point.y
-                xyz[2] += weight * point.z
-        if denominator <= 0:
-            return None
-        return Point3(*(value / denominator for value in xyz))
+        u_basis, u_span = self._basis_and_span(0, u)
+        v_basis, v_span = self._basis_and_span(1, v)
+        return self._weighted_point(u_basis, u_span, v_basis, v_span)
 
     def project(self, point, seed=None):
-        """Find a boundary point's UV coordinates by coarse search and Newton steps."""
+        """Find a boundary point's UV coordinates by coarse search and Newton steps.
+
+        Each iteration evaluates the current position once and carries that
+        point/error forward: the two extra ``error(u, v)`` calls per iteration
+        of the previous revision repeated evaluations that were already
+        available, which dominated builds of B-spline-heavy files.
+        """
         u0, u1 = self.u_range
         v0, v1 = self.v_range
         u_span, v_span = u1 - u0, v1 - v0
         target = (point.x, point.y, point.z)
 
-        def error(u, v):
-            candidate = self.evaluate(u, v)
-            if candidate is None:
+        def error(evaluation):
+            if evaluation is None:
                 return math.inf
-            return sum((getattr(candidate, axis) - target[i]) ** 2
+            return sum((getattr(evaluation, axis) - target[i]) ** 2
                        for i, axis in enumerate(("x", "y", "z")))
 
         if self._projection_grid is None:
@@ -127,17 +200,31 @@ class _RationalSplineSurface:
         if seed is not None:
             starts.insert(0, seed)
         best = (math.inf, u0, v0)
+        hu = max(u_span * 1e-5, 1e-8)
+        hv = max(v_span * 1e-5, 1e-10)
         for u, v in starts:
+            # project() stays inside [u0,u1]x[v0,v1] (every candidate and step
+            # is clamped), so the periodic wrap/clamp in evaluate() is a no-op
+            # and the basis windows can be shared between neighboring evals.
+            u_basis, u_span_index = self._basis_and_span(0, u)
+            v_basis, v_span_index = self._basis_and_span(1, v)
+            base = self._weighted_point(u_basis, u_span_index, v_basis, v_span_index)
+            if base is None:
+                continue
+            previous = error(base)
             for _ in range(18):
-                base = self.evaluate(u, v)
-                if base is None:
-                    break
-                hu = max(u_span * 1e-5, 1e-8)
-                hv = max(v_span * 1e-5, 1e-10)
                 low_u, high_u = max(u0, u - hu), min(u1, u + hu)
                 low_v, high_v = max(v0, v - hv), min(v1, v + hv)
-                pu0, pu1 = self.evaluate(low_u, v), self.evaluate(high_u, v)
-                pv0, pv1 = self.evaluate(u, low_v), self.evaluate(u, high_v)
+                # u-direction derivatives reuse v's window, and vice versa,
+                # instead of recomputing every basis from scratch per eval.
+                low_u_basis, low_u_span = self._basis_and_span(0, low_u)
+                high_u_basis, high_u_span = self._basis_and_span(0, high_u)
+                pu0 = self._weighted_point(low_u_basis, low_u_span, v_basis, v_span_index)
+                pu1 = self._weighted_point(high_u_basis, high_u_span, v_basis, v_span_index)
+                low_v_basis, low_v_span = self._basis_and_span(1, low_v)
+                high_v_basis, high_v_span = self._basis_and_span(1, high_v)
+                pv0 = self._weighted_point(u_basis, u_span_index, low_v_basis, low_v_span)
+                pv1 = self._weighted_point(u_basis, u_span_index, high_v_basis, high_v_span)
                 if None in (pu0, pu1, pv0, pv1):
                     break
                 du = tuple((getattr(pu1, axis) - getattr(pu0, axis)) / (high_u - low_u)
@@ -156,20 +243,25 @@ class _RationalSplineSurface:
                 rv = sum(x * y for x, y in zip(dv, residual))
                 step_u = max(-u_span / 4, min(u_span / 4, (ru * c - rv * b) / det))
                 step_v = max(-v_span / 4, min(v_span / 4, (rv * a - ru * b) / det))
-                previous = error(u, v)
                 moved = False
                 for divisor in (1, 2, 4, 8, 16):
                     next_u = max(u0, min(u1, u + step_u / divisor))
                     next_v = max(v0, min(v1, v + step_v / divisor))
-                    if error(next_u, next_v) < previous - 1e-16:
+                    step = self.evaluate(next_u, next_v)
+                    next_error = error(step)
+                    if next_error < previous - 1e-16:
                         u, v = next_u, next_v
+                        base, previous = step, next_error
+                        next_u_basis, next_u_span = self._basis_and_span(0, u)
+                        next_v_basis, next_v_span = self._basis_and_span(1, v)
+                        u_basis, v_basis = next_u_basis, next_v_basis
+                        u_span_index, v_span_index = next_u_span, next_v_span
                         moved = True
                         break
                 if not moved:
                     break
-            candidate = (error(u, v), u, v)
-            if candidate[0] < best[0]:
-                best = candidate
+            if previous < best[0]:
+                best = (previous, u, v)
         return best
 
 
@@ -819,9 +911,10 @@ class GeometryBuilder:
         def evaluate(parameter: float) -> Point3 | None:
             if parameter >= last:
                 return controls[-1]
-            span = next((index for index in range(degree, len(controls))
-                         if knots[index] <= parameter < knots[index + 1]), None)
-            if span is None:
+            # bisect over non-decreasing knots finds the one span with
+            # knots[i] <= parameter < knots[i+1], without scanning candidates.
+            span = bisect_right(knots, parameter) - 1
+            if span < degree:
                 return None
             values = [list(homogeneous[index]) for index in range(span - degree, span + 1)]
             for level in range(1, degree + 1):
@@ -901,15 +994,8 @@ class GeometryBuilder:
         def evaluate(parameter: float) -> Point3:
             if parameter >= last_parameter:
                 return controls[-1]
-            span = next(
-                (
-                    index
-                    for index in range(degree, len(controls))
-                    if knots[index] <= parameter < knots[index + 1]
-                ),
-                None,
-            )
-            if span is None:
+            span = bisect_right(knots, parameter) - 1
+            if span < degree:
                 return controls[0]
             values = [
                 [controls[index].x, controls[index].y, controls[index].z]
@@ -2446,29 +2532,27 @@ class GeometryBuilder:
             return None
 
         def basis(parameter: float, degree: int, knots: list[float], count: int) -> list[float]:
-            if parameter >= knots[count]:
-                return [0.0] * (count - 1) + [1.0]
-            values = [1.0 if knots[index] <= parameter < knots[index + 1] else 0.0
-                      for index in range(count + degree)]
-            for level in range(1, degree + 1):
-                values = [
-                    ((parameter - knots[index]) * values[index] / (knots[index + level] - knots[index])
-                     if knots[index + level] > knots[index] else 0.0)
-                    + ((knots[index + level + 1] - parameter) * values[index + 1]
-                       / (knots[index + level + 1] - knots[index + 1])
-                       if knots[index + level + 1] > knots[index + 1] else 0.0)
-                    for index in range(count + degree - level)
-                ]
-            return values[:count]
+            return _RationalSplineSurface._basis(parameter, degree, knots, count)
 
         def evaluate(u: float, v: float) -> Point3:
             u_basis = basis(u, u_degree, u_knots, len(control_rows))
             v_basis = basis(v, v_degree, v_knots, len(control_rows[0]))
-            return Point3(*(
-                sum(u_basis[i] * v_basis[j] * getattr(control_rows[i][j], coord)
-                    for i in range(len(control_rows)) for j in range(len(control_rows[0])))
-                for coord in ("x", "y", "z")
-            ))
+            # Matching the full product term-for-term skips exact-zero factors
+            # without changing any accumulated digit of the sums below.
+            x_sum = y_sum = z_sum = 0.0
+            for i, u_value in enumerate(u_basis):
+                if u_value == 0.0:
+                    continue
+                row = control_rows[i]
+                for j, v_value in enumerate(v_basis):
+                    if v_value == 0.0:
+                        continue
+                    product = u_value * v_value
+                    point = row[j]
+                    x_sum += product * point.x
+                    y_sum += product * point.y
+                    z_sum += product * point.z
+            return Point3(x_sum, y_sum, z_sum)
 
         def samples(knots: list[float], start: float, end: float) -> list[float]:
             breaks = sorted({value for value in knots if start - 1e-10 <= value <= end + 1e-10})
@@ -2794,13 +2878,20 @@ class GeometryBuilder:
         def evaluate(u: float, v: float) -> Point3:
             u_basis = _RationalSplineSurface._basis(u, degree_u, u_knots, len(controls))
             v_basis = _RationalSplineSurface._basis(v, degree_v, v_knots, len(controls[0]))
-            return Point3(*(
-                sum(
-                    u_basis[i] * v_basis[j] * getattr(controls[i][j], axis)
-                    for i in range(len(controls)) for j in range(len(controls[0]))
-                )
-                for axis in ("x", "y", "z")
-            ))
+            x_sum = y_sum = z_sum = 0.0
+            for i, u_value in enumerate(u_basis):
+                if u_value == 0.0:
+                    continue
+                row = controls[i]
+                for j, v_value in enumerate(v_basis):
+                    if v_value == 0.0:
+                        continue
+                    product = u_value * v_value
+                    point = row[j]
+                    x_sum += product * point.x
+                    y_sum += product * point.y
+                    z_sum += product * point.z
+            return Point3(x_sum, y_sum, z_sum)
 
         segments = loop_segments[0]
         long_indices = [index for index, segment in enumerate(segments) if len(segment) > 2]
@@ -3596,16 +3687,22 @@ class GeometryBuilder:
         refined_points = list(points)
         refined_uv = list(uv_points)
         refined_triangles = list(triangles)
+        # Vertices' surface mappings are reused across rounds; without this
+        # every refinement round re-evaluated each vertex ~6 times (once per
+        # incident edge), which reprojected thousands of points per face on
+        # B-spline-heavy files.
+        surface_xyz: list[Point3 | None] = [None] * len(refined_uv)
         for _ in range(4):
+            for index, location in enumerate(refined_uv):
+                if surface_xyz[index] is None:
+                    surface_xyz[index] = surface_point(location)
             edge_lengths: dict[tuple[int, int], float] = {}
             for triangle in refined_triangles:
                 for first, second in zip(triangle, (triangle[1], triangle[2], triangle[0])):
                     edge = tuple(sorted((first, second)))
                     if edge in boundary_edges:
                         continue
-                    first_point = surface_point(refined_uv[first])
-                    second_point = surface_point(refined_uv[second])
-                    edge_lengths[edge] = self._distance(first_point, second_point)
+                    edge_lengths[edge] = self._distance(surface_xyz[first], surface_xyz[second])
             split_edges = {
                 edge for edge, length in edge_lengths.items()
                 if length > target_edge_length
@@ -3632,7 +3729,9 @@ class GeometryBuilder:
                 )
                 midpoint_ids[(first, second)] = len(refined_points)
                 refined_uv.append(uv)
-                refined_points.append(surface_point(uv))
+                midpoint_on_surface = surface_point(uv)
+                refined_points.append(midpoint_on_surface)
+                surface_xyz.append(midpoint_on_surface)
 
             next_triangles = []
             for triangle in refined_triangles:
@@ -3655,7 +3754,9 @@ class GeometryBuilder:
                 )
                 center_id = len(refined_points)
                 refined_uv.append(center_uv)
-                refined_points.append(surface_point(center_uv))
+                center_on_surface = surface_point(center_uv)
+                refined_points.append(center_on_surface)
+                surface_xyz.append(center_on_surface)
                 next_triangles.extend(
                     (center_id, polygon[index], polygon[(index + 1) % len(polygon)])
                     for index in range(len(polygon))
