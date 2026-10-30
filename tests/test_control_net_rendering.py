@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 
 from step_explorer.geometry import ControlNet, Point3
 from step_explorer.visualization.vtk_view import vtk
@@ -40,3 +41,25 @@ def test_control_net_density_changes_only_the_rendered_grid_resolution(view):
     assert data.GetNumberOfLines() == 4
     assert control_net.row_count == 4
     assert control_net.column_count == 4
+
+
+@pytest.mark.parametrize('density, incremental', [(100, True), (50, False), (0, False)])
+def test_new_surface_density_preserves_incremental_rendering_only_at_default(view, density, incremental):
+    view._fit_camera_on_next_render = False
+    view.normal_display = 'Hidden'
+    view._analysis_face_id = None
+    view._rendered_style_signature = view._render_style_signature(False, 'index', {})
+    # Match playback: discovering a surface updates the existing density map.
+    view._last_control_net_densities[42] = density
+    snapshot = SimpleNamespace(render_updates={})
+    assert view._can_render_incrementally(snapshot, False, 'index', None) is incremental
+
+
+def test_restoring_default_density_still_invalidates_previous_custom_density(view):
+    view._fit_camera_on_next_render = False
+    view.normal_display = 'Hidden'
+    view._analysis_face_id = None
+    view._last_control_net_densities[42] = 50
+    view._rendered_style_signature = view._render_style_signature(False, 'index', None)
+    view._last_control_net_densities[42] = 100
+    assert not view._can_render_incrementally(SimpleNamespace(render_updates={}), False, 'index', None)

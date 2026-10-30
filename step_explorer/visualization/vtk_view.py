@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from step_explorer.performance import timed, context as performance_context
+
 from dataclasses import dataclass
 from colorsys import hsv_to_rgb
-from math import atan2, ceil, cos, dist, exp, floor, hypot, log10, pi, sin, sqrt, tan
+from math import atan2, ceil, cos, dist, exp, floor, hypot, isfinite, log10, pi, sin, sqrt, tan
 from random import Random
+from statistics import median
+from PySide6.QtGui import QImage
 
 from ..geometry.builder import Point3
 from ..ui.colors import color_for_category
@@ -143,6 +147,8 @@ class VtkView(QWidget):
         self._xy_grid_actor = None
         self._xy_grid_mapper = None
         self._actors = []
+        self._batch_positions = False
+        self._position_batch_actors = []
         self._actors_by_entity: dict[int, list] = {}
         self._face_actors: dict[int, object] = {}
         self._selection_flash_face_id: int | None = None
@@ -156,6 +162,8 @@ class VtkView(QWidget):
         self._rendered_bounds: tuple[float, float, float, float, float, float] | None = None
         self._mesh_edge_actors = []
         self._initialized = False
+        self.playback_locked = False
+        self._playback_notice = None
         self._fit_camera_on_next_render = True
         self._last_snapshot = None
         self._last_selected_id = None
@@ -202,6 +210,15 @@ class VtkView(QWidget):
             return
         self.widget = QVTKRenderWindowInteractor(self)
         self.widget.installEventFilter(self)
+        self._playback_notice = QLabel(
+            "Viewport locked during playback · Ctrl+P to pause\n"
+            "Pan, rotate and zoom are available while paused.", self.widget
+        )
+        self._playback_notice.setStyleSheet(
+            "QLabel { background: #20242a; color: #ffffff; padding: 8px; border: 1px solid #667788; }"
+        )
+        self._playback_notice.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._playback_notice.hide()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.widget)
@@ -303,8 +320,54 @@ class VtkView(QWidget):
                 return "orbit" if left else "pan"
         return None
 
+    def set_playback_locked(self, locked: bool) -> None:
+        self.playback_locked = locked
+        self._navigation_action = None
+        self._orbit_button = Qt.MouseButton.NoButton
+        self._last_orbit_pos = None
+        self._press_pos = None
+        if self._playback_notice is not None:
+            self._playback_notice.adjustSize()
+            self._playback_notice.move(14, max(14, self.widget.height() - self._playback_notice.height() - 14))
+            self._playback_notice.setVisible(locked)
+            self._playback_notice.raise_()
+
+    @timed("viewport.capture_preview")
+    def capture_frame(self):
+        """Copy the last rendered frame as PNG, excluding Qt overlays."""
+        if not self._initialized or self.renderer is None:
+            return None
+        capture = vtk.vtkWindowToImageFilter()
+        capture.SetInput(self.widget.GetRenderWindow())
+        capture.SetInputBufferTypeToRGB()
+        capture.ReadFrontBufferOff()
+        capture.ShouldRerenderOff()
+        writer = vtk.vtkPNGWriter()
+        writer.SetInputConnection(capture.GetOutputPort())
+        writer.WriteToMemoryOn()
+        writer.Write()
+        image = QImage.fromData(memoryview(writer.GetResult()).tobytes(), "PNG")
+        return None if image.isNull() else image
+
     def eventFilter(self, watched, event):
-        if watched is getattr(self, "widget", None) and self.renderer is not None:
+        if watched in {self, getattr(self, "widget", None)} and self.playback_locked:
+            event_type = event.type()
+            if event_type == QEvent.Type.Resize:
+                self.set_playback_locked(True)
+            if event_type in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease}:
+                if event.key() == Qt.Key.Key_P and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                    return False
+                event.accept()
+                return True
+            if event_type in {
+                QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                QEvent.Type.MouseButtonDblClick, QEvent.Type.MouseMove,
+                QEvent.Type.Wheel, QEvent.Type.ContextMenu, QEvent.Type.Gesture,
+                QEvent.Type.NativeGesture, QEvent.Type.TouchBegin,
+                QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd,
+            }:
+                return True
+        if watched is getattr(self, "widget", None) and getattr(self, "renderer", None) is not None:
             event_type = event.type()
             if event_type == QEvent.Type.ToolTip and self._model_check_tooltip:
                 size = [0.0, 0.0]
@@ -411,7 +474,7 @@ class VtkView(QWidget):
         camera.SetPosition(*(old_position[i] + center[i] - old_focal[i] for i in range(3)))
         self._reset_clipping_range()
         if self._initialized:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
         return True
 
     def set_projection_mode(self, mode: str) -> None:
@@ -438,7 +501,7 @@ class VtkView(QWidget):
             camera.ParallelProjectionOff()
         self._reset_clipping_range()
         if self._initialized:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
 
     def set_model_check_text(self, summary: str, tooltip: str = "") -> None:
         self._model_check_tooltip = tooltip if summary else ""
@@ -470,7 +533,7 @@ class VtkView(QWidget):
         camera.SetPosition(*(position[i] + offset[i] for i in range(3)))
         camera.SetFocalPoint(*(focal[i] + offset[i] for i in range(3)))
         self._reset_clipping_range()
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     def _zoom_camera(self, dy: float) -> None:
         if not dy:
@@ -482,7 +545,7 @@ class VtkView(QWidget):
         else:
             camera.Dolly(factor)
         self._reset_clipping_range()
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     def _trackball_orbit_camera(self, previous, current) -> None:
         width = max(self.widget.width(), 1)
@@ -550,7 +613,7 @@ class VtkView(QWidget):
         camera.SetViewUp(*rotate(view_up))
         camera.OrthogonalizeViewUp()
         self._reset_clipping_range()
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     def _orbit_camera(self, dx: float, dy: float) -> None:
         if not (dx or dy):
@@ -564,7 +627,7 @@ class VtkView(QWidget):
         camera.SetViewUp(0.0, 0.0, 1.0)
         camera.OrthogonalizeViewUp()
         self._reset_clipping_range()
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     def set_autozoom(self, enabled: bool) -> None:
         """Choose whether every snapshot refits the visible geometry."""
@@ -580,7 +643,7 @@ class VtkView(QWidget):
         _reset_isometric_camera(self.renderer)
         self._reset_clipping_range()
         if self._initialized:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
 
     def set_show_xyz_origin(self, enabled: bool) -> None:
         """Show or hide the world XYZ axes rooted at (0, 0, 0)."""
@@ -589,7 +652,7 @@ class VtkView(QWidget):
         if self._xyz_origin_axes is not None:
             self._xyz_origin_axes.SetVisibility(self.show_xyz_origin)
         if self.renderer is not None and self._initialized:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
 
     def set_show_xy_grid(self, enabled: bool) -> None:
         """Show or hide the world XY grid, which expands to fit visible geometry."""
@@ -599,7 +662,7 @@ class VtkView(QWidget):
             self._xy_grid_actor.SetVisibility(self.show_xy_grid)
         if self.renderer is not None and self._initialized:
             self._reset_clipping_range()
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
 
     def set_xy_grid_color(self, color: str) -> None:
         rgb = self._parse_hex_color(color)
@@ -609,7 +672,7 @@ class VtkView(QWidget):
         if self._xy_grid_actor is not None:
             self._xy_grid_actor.GetProperty().SetColor(*rgb)
         if self.renderer is not None and self._initialized:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
 
     def set_background_color(self, color: str) -> None:
         rgb = self._parse_hex_color(color)
@@ -619,7 +682,7 @@ class VtkView(QWidget):
         if self.renderer is not None:
             self.renderer.SetBackground(*rgb)
             if self._initialized:
-                self.widget.GetRenderWindow().Render()
+                self._profiled_render()
 
     def set_xy_grid_scale(self, scale: float) -> None:
         self.xy_grid_scale = self._clamp_xy_grid_scale(scale)
@@ -631,7 +694,7 @@ class VtkView(QWidget):
             self._update_xy_grid(())
         if self.renderer is not None and self._initialized:
             self._reset_clipping_range()
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
 
     @staticmethod
     def _parse_hex_color(color: str) -> tuple[float, float, float] | None:
@@ -744,7 +807,7 @@ class VtkView(QWidget):
             if back is not None:
                 back.SetEdgeOpacity(self.mesh_edge_opacity)
         if self.renderer is not None and self._initialized and self._mesh_edge_actors:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
 
     def set_max_entity_labels(self, limit: int) -> None:
         self.max_entity_labels = self._clamp_label_limit(limit)
@@ -817,7 +880,7 @@ class VtkView(QWidget):
         if (not style_changed and self._analysis_normal_glyph is not None
                 and self.renderer is not None and self._initialized):
             self._analysis_normal_glyph.SetScaleFactor(self._normal_length * new_normal_scale)
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
             return
         if self.renderer is not None and self._initialized and self._last_snapshot is not None:
             self._render_snapshot(
@@ -836,7 +899,7 @@ class VtkView(QWidget):
         self._fit_camera_on_next_render = True
 
     def fit_camera(self) -> None:
-        """Frame rendered faces, falling back to the scene when there are none."""
+        """Frame rendered faces or the main cluster of preview positions."""
 
         self._fit_camera_on_next_render = True
         if self.renderer is None or not self._initialized:
@@ -844,7 +907,7 @@ class VtkView(QWidget):
         self._fit_rendered_faces()
         self._reset_clipping_range()
         self._fit_camera_on_next_render = False
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     def _fit_rendered_faces(self) -> None:
         points = []
@@ -854,10 +917,34 @@ class VtkView(QWidget):
                 if actor is not None and actor.GetVisibility():
                     points.extend(face.points[index] for triangle in face.triangles for index in triangle)
         bounds = self._bounds(points)
+        if bounds is None and self._last_snapshot is not None:
+            points = self._snapshot_points(
+                self._last_snapshot,
+                include_point_markers=getattr(self, '_last_show_points', True),
+            )
+            bounds = self._cluster_bounds(points)
         if bounds is None:
             self.renderer.ResetCamera()
         else:
             self.renderer.ResetCamera(bounds)
+
+    @classmethod
+    def _cluster_bounds(cls, points):
+        """Frame almost all preview positions without extreme remote origins.
+
+        Deduplicate so repeated references cannot dominate the estimate. Keep
+        small scenes intact; trim only beyond ten times the 90% core radius.
+        This is a framing heuristic, never a geometry validity decision.
+        """
+        coordinates = sorted({(p.x, p.y, p.z) for p in points
+                              if all(isfinite(v) for v in (p.x, p.y, p.z))})
+        if len(coordinates) >= 20:
+            center = tuple(median(p[axis] for p in coordinates) for axis in range(3))
+            radii = [dist(p, center) for p in coordinates]
+            core_radius = sorted(radii)[ceil(len(radii) * 0.9) - 1]
+            cutoff = core_radius * 10
+            coordinates = [p for p, radius in zip(coordinates, radii) if radius <= cutoff]
+        return cls._bounds([Point3(*p) for p in coordinates])
 
     def fit_analysis_face(self) -> None:
         """Fit the analyzed mesh, or its control net/boundary when unmeshed."""
@@ -912,6 +999,16 @@ class VtkView(QWidget):
         """Mark the exact shared STEP edge and its two adjacent preview faces."""
         self._issue_blink_timer.stop()
         self._issue_blink_steps.clear()
+        if edge_id is None and not (
+            self._issue_edge_actor is not None
+            or self._issue_face_properties
+            or self._issue_overview_edge_actors
+            or self._issue_overview_properties
+        ):
+            # Ordinary playback clears the issue marker after presenting each
+            # frame. With nothing highlighted, that must not render it again.
+            self._issue_edge_id = None
+            return
         self._clear_issue_overview()
         self._issue_edge_id = edge_id
         if self.renderer is None or not self._initialized:
@@ -924,7 +1021,7 @@ class VtkView(QWidget):
             actor.SetBackfaceProperty(backface)
         self._issue_face_properties.clear()
         if edge_id is None or self._last_snapshot is None:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
             return
         for face_id, color in zip(face_ids, ((1.0, 0.54, 0.16), (0.25, 0.93, 0.66))):
             actor = self._face_actors.get(face_id)
@@ -963,7 +1060,7 @@ class VtkView(QWidget):
             actor.SetPickable(False)
             self.renderer.AddActor(actor)
             self._issue_edge_actor = actor
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     def _clear_issue_overview(self) -> None:
         if self.renderer is None:
@@ -1033,7 +1130,7 @@ class VtkView(QWidget):
             actor.SetPickable(False)
             self.renderer.AddActor(actor)
             self._issue_overview_edge_actors.append(actor)
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     def blink_issue_edge_and_faces(self) -> None:
         """Flash the edge three times, then each adjacent face three times."""
@@ -1065,7 +1162,7 @@ class VtkView(QWidget):
                 actor.GetProperty().SetColor(*colors[index])
                 actor.GetProperty().SetOpacity(1.0 if not finished else 0.72)
                 actor.GetProperty().LightingOff()
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
         if finished:
             self._issue_blink_steps.clear()
         else:
@@ -1086,7 +1183,7 @@ class VtkView(QWidget):
             bounds.extend((min(values), max(values)))
         self.renderer.ResetCamera(tuple(bounds))
         self._reset_clipping_range()
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
 
     @classmethod
     def _clamp_label_limit(cls, limit: int) -> int:
@@ -1144,6 +1241,9 @@ class VtkView(QWidget):
     ) -> None:
         if self.renderer is None:
             return
+        performance_context(points=len(snapshot.points), vertices=len(snapshot.vertices),
+                            faces=len(snapshot.faces), polylines=len(snapshot.polylines),
+                            labels=labels, show_points=show_points, turbo=fast_preview)
         selection_changed = selected_id != self._last_selected_id
         if selection_changed:
             self._selection_flash_timer.stop()
@@ -1197,7 +1297,7 @@ class VtkView(QWidget):
         self._selection_flash_face_id = entity_id
         self._set_selected_face_brightness(actor, entity_id, 0.72)
         if self._initialized:
-            self.widget.GetRenderWindow().Render()
+            self._profiled_render()
         self._selection_flash_timer.start(180)
 
     def _finish_selection_flash(self) -> None:
@@ -1209,8 +1309,9 @@ class VtkView(QWidget):
         if actor is not None:
             self._set_selected_face_brightness(actor, entity_id, 0.4)
             if self._initialized:
-                self.widget.GetRenderWindow().Render()
+                self._profiled_render()
 
+    @timed("viewport.scene")
     def _render_snapshot(
         self,
         snapshot,
@@ -1237,6 +1338,7 @@ class VtkView(QWidget):
             )
             return
 
+        performance_context(render_mode="full")
         snapshot_points = self._snapshot_points(
             snapshot, include_point_markers=self._last_show_points,
         )
@@ -1246,6 +1348,7 @@ class VtkView(QWidget):
         for actor in self._actors:
             self.renderer.RemoveActor(actor)
         self._actors.clear()
+        self._position_batch_actors.clear()
         self._actors_by_entity.clear()
         self._face_actors.clear()
         self._analysis_normal_glyph = None
@@ -1260,6 +1363,7 @@ class VtkView(QWidget):
             snapshot.faces, getattr(self, "normal_arrow_limit", self.DEFAULT_NORMAL_ARROW_LIMIT),
         )
         analysis_active = self._analysis_face_id is not None
+        self._batch_positions = self._last_show_points and not analysis_active
         show_normals = (
             getattr(self, "normal_display", "Hidden") == "Vectors"
             or (analysis_active and self._analysis_show_normals)
@@ -1291,6 +1395,8 @@ class VtkView(QWidget):
                 self._last_show_points,
             )
         self._active_entity_id = None
+        if self._batch_positions:
+            self._update_position_batches(selected_id)
         if (self.autozoom and not analysis_active) or self._fit_camera_on_next_render:
             self._fit_rendered_faces()
             self._fit_camera_on_next_render = False
@@ -1298,7 +1404,7 @@ class VtkView(QWidget):
         if labels or analysis_active:
             self._place_labels()
         self._update_warning_balloons(snapshot)
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
         self._rendered_style_signature = self._render_style_signature(
             labels, label_mode, control_net_densities,
             self._last_show_points, self._last_fast_preview,
@@ -1345,7 +1451,13 @@ class VtkView(QWidget):
             self.show_mesh_edges,
             self.mesh_edge_opacity,
             self.normal_display,
-            tuple(sorted(densities.items())),
+            # Newly discovered surfaces acquire an explicit default density.
+            # That is visually identical to an absent entry and must not
+            # invalidate every actor during incremental playback.
+            tuple(sorted(
+                (entity_id, density) for entity_id, density in densities.items()
+                if density != self.DEFAULT_CONTROL_NET_DENSITY
+            )),
             show_points,
             fast_preview,
         )
@@ -1363,6 +1475,7 @@ class VtkView(QWidget):
             )
         )
 
+    @timed("viewport.incremental")
     def _render_snapshot_incremental(
         self,
         snapshot,
@@ -1374,11 +1487,17 @@ class VtkView(QWidget):
         control_net_densities,
     ) -> None:
         updates = snapshot.render_updates or {}
+        positions_changed = selected_id != self._rendered_selected_id
+        performance_context(render_mode="incremental", render_updates=len(updates))
         faces_changed = False
         changed_face_ids = set()
         bounds_may_shrink = False
         for entity_id, item in updates.items():
             previous = self._rendered_items.get(entity_id)
+            positions_changed |= (
+                (previous is not None and previous[0] in {"point", "vertex"})
+                or (item is not None and item[0] in {"point", "vertex"})
+            )
             faces_changed |= (previous is not None and previous[0] == "face")
             if previous is not None and previous[0] == "face":
                 changed_face_ids.add(entity_id)
@@ -1419,6 +1538,9 @@ class VtkView(QWidget):
                     self._last_show_points,
                 )
         self._active_entity_id = None
+
+        if self._batch_positions and positions_changed:
+            self._update_position_batches(selected_id)
 
         changed_points = []
         for record in updates.values():
@@ -1462,13 +1584,14 @@ class VtkView(QWidget):
         self._reset_clipping_range()
         if faces_changed:
             self._update_warning_balloons(snapshot, changed_face_ids=changed_face_ids)
-        self.widget.GetRenderWindow().Render()
+        self._profiled_render()
         self._rendered_selected_id = selected_id
         self._rendered_style_signature = self._render_style_signature(
             False, label_mode, control_net_densities,
             self._last_show_points, self._last_fast_preview,
         )
 
+    @timed("viewport.actors")
     def _render_entity_item(
         self,
         entity_id,
@@ -1490,6 +1613,13 @@ class VtkView(QWidget):
             category = "Geometry" if kind == "point" else "Topology"
             boundary_vertex = analysis_active and entity_id in self._analysis_boundary_vertex_ids
             if not show_points and not boundary_vertex:
+                return
+            if self._batch_positions and not selected:
+                if labels:
+                    self._add_label(
+                        entity_id, (item.x, item.y, item.z), color_for_category(category),
+                        label_scale, label_text, False, 2 if kind == "vertex" else 3,
+                    )
                 return
             self._add_point(
                 entity_id,
@@ -1562,6 +1692,7 @@ class VtkView(QWidget):
         self._actors = [actor for actor in self._actors if id(actor) not in removed]
         self._mesh_edge_actors = [actor for actor in self._mesh_edge_actors if id(actor) not in removed]
 
+    @timed("viewport.warnings")
     def _update_warning_balloons(self, snapshot, changed_face_ids=None) -> None:
         if changed_face_ids is not None:
             removed_buttons = set()
@@ -1674,6 +1805,7 @@ class VtkView(QWidget):
             length = max(span * 0.08, 1e-6)
         axes.SetTotalLength(length, length, length)
 
+    @timed("viewport.clipping")
     def _reset_clipping_range(self) -> None:
         """Include the grid in clipping without letting it change camera framing."""
 
@@ -1694,6 +1826,18 @@ class VtkView(QWidget):
             self.renderer.ResetCameraClippingRange(bounds)
         else:
             self.renderer.ResetCameraClippingRange()
+
+        # A distant STEP construction point (or the grid it expands) can make
+        # VTK choose a near plane beyond the camera's focal point. Preserve the
+        # current view of nearby geometry while retaining the computed far
+        # plane so the distant geometry is still available when navigating.
+        camera = self.renderer.GetActiveCamera()
+        near, far = camera.GetClippingRange()
+        focal_distance = camera.GetDistance()
+        if focal_distance > 0 and near >= focal_distance:
+            camera.SetClippingRange(min(near, focal_distance * 0.001), far)
+        performance_context(clipping_range=list(camera.GetClippingRange()),
+                            camera_distance=focal_distance)
 
     def _update_xy_grid(self, points) -> None:
         """Build a world-origin XY grid with bounds that grow to cover the model."""
@@ -1809,6 +1953,7 @@ class VtkView(QWidget):
             )
         )
 
+    @timed("viewport.labels")
     def _place_labels(self) -> None:
         """Place labels in display space and add callouts for collisions."""
 
@@ -1990,6 +2135,39 @@ class VtkView(QWidget):
             sum(getattr(point, axis) for point in points) / len(points)
             for axis in ("x", "y", "z")
         )
+
+    @timed("viewport.position_batches")
+    def _update_position_batches(self, selected_id):
+        """Keep every ordinary marker in two actors; selection stays separate."""
+        removed = {id(actor) for actor in self._position_batch_actors}
+        for actor in self._position_batch_actors:
+            self.renderer.RemoveActor(actor)
+        self._actors[:] = [actor for actor in self._actors if id(actor) not in removed]
+        self._position_batch_actors.clear()
+        for kind, category in (("point", "Geometry"), ("vertex", "Topology")):
+            points = vtk.vtkPoints()
+            points.SetDataTypeToDouble()
+            cells = vtk.vtkCellArray()
+            for entity_id, (item_kind, item) in self._rendered_items.items():
+                if item_kind != kind or entity_id == selected_id:
+                    continue
+                index = points.InsertNextPoint(item.x, item.y, item.z)
+                cells.InsertNextCell(1)
+                cells.InsertCellPoint(index)
+            if not points.GetNumberOfPoints():
+                continue
+            data = vtk.vtkPolyData()
+            data.SetPoints(points)
+            data.SetVerts(cells)
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(data)
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetPointSize(6)
+            actor.GetProperty().SetColor(*color_for_category(category))
+            self.renderer.AddActor(actor)
+            self._register_actor(actor)
+            self._position_batch_actors.append(actor)
 
     def _add_point(
         self, entity_id, x, y, z, selected, category, labels, label_scale,
@@ -2318,3 +2496,8 @@ class VtkView(QWidget):
         actor.SetPickable(False)
         self.renderer.AddActor(actor)
         self._register_actor(actor)
+
+    @timed("viewport.render")
+    def _profiled_render(self):
+        performance_context(actors=len(self._actors))
+        self.widget.GetRenderWindow().Render()

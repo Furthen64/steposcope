@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from step_explorer.performance import timed
+
 from ..step.values import value_to_text
 
 try:
@@ -14,6 +16,7 @@ class EntityDetails(QPlainTextEdit):
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
 
+    @timed("ui.details")
     def show_entity(self, entity, document) -> None:
         if entity is None:
             self.clear()

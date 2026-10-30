@@ -54,12 +54,40 @@ def test_fit_uses_visible_face_triangles_instead_of_distant_points():
 def test_fit_falls_back_to_scene_without_visible_faces():
     view = VtkView.__new__(VtkView)
     view.renderer = Mock()
-    view._last_snapshot = SimpleNamespace(faces=[])
+    view._last_snapshot = SimpleNamespace(faces=[], points={}, vertices={}, polylines=[], control_nets=[])
     view._face_actors = {}
 
     view._fit_rendered_faces()
 
     view.renderer.ResetCamera.assert_called_once_with()
+
+
+def test_preview_fit_ignores_extreme_line_origin_without_removing_it():
+    view = VtkView.__new__(VtkView)
+    view.renderer = Mock()
+    cluster = {i: Point3(float(i % 5), float(i // 5), 0) for i in range(25)}
+    remote = Point3(16, 498996.5, 498981.8)
+    cluster[99] = remote
+    view._last_snapshot = SimpleNamespace(faces=[], points=cluster, vertices={}, polylines=[], control_nets=[])
+    view._face_actors = {}
+    view._fit_rendered_faces()
+    view.renderer.ResetCamera.assert_called_once_with((0, 4, 0, 4, 0, 0))
+    assert view._last_snapshot.points[99] is remote
+
+
+def test_cluster_framing_preserves_small_scenes_and_separate_substantial_parts():
+    assert VtkView._cluster_bounds([Point3(0, 0, 0), Point3(1e6, 0, 0)]) == (0, 1e6, 0, 0, 0, 0)
+    points = [Point3(float(i), 0, 0) for i in range(25)]
+    points += [Point3(10000 + float(i), 0, 0) for i in range(10)]
+    assert VtkView._cluster_bounds(points) == (0, 10009, 0, 0, 0, 0)
+
+
+def test_cluster_framing_is_scale_independent_and_ignores_duplicate_references():
+    points = [Point3(float(i % 5), float(i // 5), 0) for i in range(25)]
+    remote = Point3(1e6, 1e6, 1e6)
+    for scale in (1e-6, 1, 1e6):
+        scaled = [Point3(p.x * scale, p.y * scale, p.z * scale) for p in points + [remote] * 100]
+        assert VtkView._cluster_bounds(scaled) == pytest.approx((0, 4 * scale, 0, 4 * scale, 0, 0))
 
 
 @pytest.mark.parametrize("key,method", [(Qt.Key.Key_R, "reset_camera"), (Qt.Key.Key_F, "fit_camera")])
@@ -144,3 +172,31 @@ def test_camera_clipping_includes_grid_without_using_it_to_frame_model(view):
     assert model_only_far < 3
     assert camera.GetClippingRange()[1] > 3
     assert view.renderer.ComputeVisiblePropBounds() == pytest.approx(actor.GetBounds())
+
+
+@pytest.mark.parametrize('parallel', [False, True])
+def test_distant_point_does_not_clip_model_at_camera_focus(view, parallel):
+    # AL39 point #8792 expands bounds from hundreds to roughly 499,000 units.
+    for center in ((0, 0, 0), (0, 498996.5, 498981.8)):
+        source = vtk.vtkCubeSource()
+        source.SetCenter(*center)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        view.renderer.AddActor(actor)
+    camera = view.renderer.GetActiveCamera()
+    camera.SetParallelProjection(parallel)
+    camera.SetPosition(-500, -500, -500)
+    camera.SetFocalPoint(0, 0, 0)
+    view.renderer.ResetCameraClippingRange()
+    original_far = camera.GetClippingRange()[1]
+    assert camera.GetClippingRange()[0] > camera.GetDistance()
+
+    view._reset_clipping_range()
+
+    near, far = camera.GetClippingRange()
+    assert near < camera.GetDistance() < far
+    assert far >= original_far
+    assert camera.GetPosition() == pytest.approx((-500, -500, -500))
+    assert camera.GetFocalPoint() == pytest.approx((0, 0, 0))

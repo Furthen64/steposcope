@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from step_explorer.performance import get_log, timed, span, context as performance_context
+
 from dataclasses import replace
 from math import isfinite
 from pathlib import Path
@@ -24,7 +26,7 @@ from .step_lines import STEP_LINE_PALETTES
 from ..visualization.vtk_view import VtkView
 
 from PySide6.QtCore import QEvent, QPropertyAnimation, QSettings, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -89,6 +91,11 @@ class MainWindow(QMainWindow):
     # end of the loop stops the batch, whichever comes first.
     FAST_PREVIEW_BATCH_SIZE = 256
     FAST_PREVIEW_BATCH_BUDGET_SECONDS = 0.020
+    # Start each presentation at least 250 ms after the previous one finishes.
+    # Rendering time must not consume the budget for making source progress.
+    FAST_PREVIEW_PRESENT_INTERVAL_SECONDS = 0.250
+    HEAVY_PLAYBACK_ENTITY_COUNT = 50_000
+    HEAVY_PLAYBACK_PRESENT_INTERVAL_SECONDS = 10.0
     NAVIGATION_PRESET_DEFAULTS = {
         "Blender": (False, True),
         "CAD": (True, False),
@@ -110,6 +117,7 @@ class MainWindow(QMainWindow):
         self.invert_mouse_vertical = self._load_invert_mouse_axis("vertical")
         self.orbit_method = self._load_orbit_method()
         self.show_entity_labels = self._load_show_entity_labels()
+        self.show_positions = self.settings.value("show_positions", True, type=bool)
         self.show_xyz_origin = self._load_show_xyz_origin()
         self.show_xy_grid = self._load_show_xy_grid()
         self.show_mesh_edges = bool(self.settings.value("show_mesh_edges", False, type=bool))
@@ -124,7 +132,12 @@ class MainWindow(QMainWindow):
         )
         self.playback_speed = self._load_playback_speed()
         self.playback_order = 0
+        self._playback_duration_confirmed = False
         self._last_playback_step_finished: float | None = None
+        self._pending_playback_snapshot = None
+        self._pending_playback_updates = {}
+        self._pending_playback_full_redraw = False
+        self._last_playback_presented_at = monotonic()
         self.control_net_densities: dict[int, int] = {}
         self._control_nets_by_id = {}
         self._control_net_statuses_by_id = {}
@@ -133,6 +146,12 @@ class MainWindow(QMainWindow):
         self.playback_timer = QTimer(self)
         self.playback_timer.setInterval(self._playback_interval())
         self.playback_timer.timeout.connect(self._playback_tick)
+        performance_log = get_log()
+        if performance_log is not None:
+            self.performance_timer = QTimer(self)
+            self.performance_timer.setInterval(2000)
+            self.performance_timer.timeout.connect(performance_log.flush)
+            self.performance_timer.start()
         self.recent_files: list[str] = self._load_recent_files()
         self.current_id: int | None = None
         self.analyzed_face_id: int | None = None
@@ -433,9 +452,11 @@ class MainWindow(QMainWindow):
         self.fast_preview_checkbox.setChecked(self.settings.value("fast_preview", False, type=bool))
         self.fast_preview_checkbox.setToolTip(
             "Set Max speed to 100%. Interpret up to 256 consecutive STEP entities or about 20 ms "
-            "of work per playback tick, "
-            "then refresh the viewport once per batch. During playback, hide standalone point "
-            "and vertex markers once other geometry appears, and hide triangle-edge overlays. "
+            "of work per playback tick. Accumulate changes between GUI refreshes, with at least 250 ms "
+            "of progress time after each refresh (10 seconds for files with 50,000+ records). "
+            "Pausing shows the latest processed state immediately. "
+            "Triangle-edge overlays are hidden during playback. "
+            "Position markers are controlled separately by Show positions. "
             "Source order and entity inspection are preserved; the displayed geometry may advance in larger jumps."
         )
         self.reset_view_button = QPushButton("Reset view")
@@ -507,6 +528,25 @@ class MainWindow(QMainWindow):
         )
         self.shape_expectation_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.shape_expectation_label.hide()
+        self.paused_preview_panel = QFrame(self.shape_expectation_label.parentWidget())
+        self.paused_preview_panel.setObjectName("pausedPreview")
+        self.paused_preview_panel.setStyleSheet(
+            "QFrame#pausedPreview { background: #20242a; border: 1px solid #68717c; border-radius: 5px; }"
+            "QLabel { color: #f2f4f8; border: none; }"
+        )
+        self.paused_preview_panel.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        preview_layout = QVBoxLayout(self.paused_preview_panel)
+        preview_layout.setContentsMargins(6, 5, 6, 6)
+        preview_layout.setSpacing(4)
+        self.paused_preview_caption = QLabel("Last paused view", self.paused_preview_panel)
+        self.paused_preview_image = QLabel(self.paused_preview_panel)
+        self.paused_preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.paused_preview_image.setMinimumSize(1, 1)
+        preview_layout.addWidget(self.paused_preview_caption)
+        preview_layout.addWidget(self.paused_preview_image, 1)
+        self._paused_preview_pixmap = None
+        self._paused_preview_size = None
+        self.paused_preview_panel.hide()
         self._build_file_menu()
         self._build_ui()
         self._connect_signals()
@@ -583,6 +623,11 @@ class MainWindow(QMainWindow):
         self.show_mesh_edges_action.setChecked(self.show_mesh_edges)
         self.show_mesh_edges_action.setToolTip("Draw triangle edges over shaded faces")
         view_menu.addAction(self.show_mesh_edges_action)
+        self.show_positions_action = QAction("Show positions", self)
+        self.show_positions_action.setCheckable(True)
+        self.show_positions_action.setChecked(self.show_positions)
+        self.show_positions_action.setToolTip("Show position markers during playback. Paused previews always show positions for inspection.")
+        view_menu.addAction(self.show_positions_action)
         self.background_color_action = QAction("Background color…", self)
         self.background_color_action.triggered.connect(self._choose_background_color)
         view_menu.addAction(self.background_color_action)
@@ -730,7 +775,7 @@ class MainWindow(QMainWindow):
         }.get(self.navigation_preset, "MMB orbit · Shift+MMB pan · wheel zoom")
         self.hotkey_legend.setText(
             "Hotkeys: Ctrl+O open · Ctrl+Q quit · Ctrl+Shift+G geometry only · "
-            f"Space play/pause · L labels · T label content · R reset view · F fit · {gestures}"
+            f"Ctrl+P play/pause · L labels · T label content · R reset view · F fit · {gestures}"
         )
 
     def _load_label_mode(self) -> str:
@@ -854,11 +899,13 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         self.tree.set_step_line_appearance(self.step_lines_palette, show_emojis, color_source)
 
+    @timed("ui.label_texts")
     def _label_texts(self) -> dict[int, str]:
         if not self.document or not self.show_entity_labels:
             return {}
         return {entity.entity_id: _label_for_entity_type(entity.type_name) for entity in self.document.entities}
 
+    @timed("ui.label_orders")
     def _label_orders(self) -> dict[int, int]:
         if not self.document or not self.show_entity_labels:
             return {}
@@ -884,6 +931,13 @@ class MainWindow(QMainWindow):
         if self.current_snapshot is not None and self.play_button.isChecked():
             self._show_snapshot(self.current_snapshot, self.current_id, update_surface_controls=False)
 
+    def _show_positions_changed(self, enabled: bool):
+        self.show_positions = enabled
+        self.settings.setValue("show_positions", enabled)
+        self.settings.sync()
+        if self.current_snapshot is not None:
+            self._show_snapshot(self.current_snapshot, self.current_id, update_surface_controls=False)
+
     def _refresh_viewport_with_surface_controls(self, update_surface_controls: bool = True):
         if not self.document or not self.document.entities:
             return
@@ -891,6 +945,7 @@ class MainWindow(QMainWindow):
         snapshot = builder.build(self.discovered_order)
         self._show_snapshot(snapshot, self.current_id, update_surface_controls)
 
+    @timed("ui.snapshot")
     def _show_snapshot(
         self,
         snapshot,
@@ -898,6 +953,10 @@ class MainWindow(QMainWindow):
         update_surface_controls: bool = True,
         incremental: bool = False,
     ):
+        if not incremental:
+            if snapshot is self.current_snapshot and self._pending_playback_snapshot is not None:
+                snapshot = self._pending_playback_snapshot
+            self._clear_playback_updates()
         if self.analyzed_face_id is not None:
             if self._analysis_snapshot is None and self.document is not None:
                 self._analysis_snapshot = (self.geometry_builder or GeometryBuilder(self.document)).build()
@@ -930,11 +989,7 @@ class MainWindow(QMainWindow):
             self._update_surface_controls(snapshot)
         hidden_ids = self.object_tree.hidden_entity_ids()
         viewport_snapshot = self._visible_snapshot(snapshot, hidden_ids) if hidden_ids else snapshot
-        has_drawable_geometry = bool(
-            viewport_snapshot.faces or viewport_snapshot.polylines or viewport_snapshot.control_nets
-        )
         turbo_active = self.fast_preview_checkbox.isChecked() and self.play_button.isChecked()
-        show_points = not turbo_active or not has_drawable_geometry
         self.viewport.show_snapshot(
             viewport_snapshot,
             selected_id=selected_id,
@@ -945,11 +1000,13 @@ class MainWindow(QMainWindow):
             label_time=self.discovered_order,
             control_net_densities=self.control_net_densities,
             incremental=incremental and not hidden_ids,
-            show_points=show_points,
+            show_points=self.show_positions or not self.play_button.isChecked(),
             fast_preview=turbo_active,
         )
         self._show_edge_issue()
-        self.focus_face_button.setEnabled(self.viewport.has_rendered_face(selected_id))
+        self.focus_face_button.setEnabled(
+            not self.viewport.playback_locked and self.viewport.has_rendered_face(selected_id)
+        )
         if self.analyzed_face_id is not None:
             self._update_face_assessment()
 
@@ -977,6 +1034,7 @@ class MainWindow(QMainWindow):
         finally:
             self.viewport.autozoom = autozoom
 
+    @timed("ui.warnings")
     def _update_preview_warnings(self, snapshot, incremental: bool = False) -> None:
         if self.document is None:
             self.preview_warning_button.hide()
@@ -1055,6 +1113,7 @@ class MainWindow(QMainWindow):
             self._toggle_interpretation_panel()
         self.preview_warning_details.setFocus()
 
+    @timed("ui.completeness")
     def _update_model_completeness(self, snapshot) -> None:
         if self.document is None:
             return
@@ -1301,6 +1360,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.face_color_mode)
         toolbar.addSeparator()
         toolbar.addAction(self.show_mesh_edges_action)
+        toolbar.addAction(self.show_positions_action)
         self.preferences_button = QToolButton(self.menuBar())
         self.preferences_button.setObjectName("preferencesButton")
         self.preferences_button.setText("⚙")
@@ -1370,7 +1430,7 @@ class MainWindow(QMainWindow):
         playback_controls_layout.addWidget(play_control)
         self.play_button.setFixedWidth(90)
         self.llm_report_button.setFixedWidth(90)
-        self.play_button.setToolTip("Play or pause STEP playback (Space)")
+        self.play_button.setToolTip("Play or pause STEP playback (Ctrl+P)")
         playback_controls_layout.addSpacing(10)
         playback_separator = QFrame()
         playback_separator.setFrameShape(QFrame.Shape.VLine)
@@ -1501,8 +1561,17 @@ class MainWindow(QMainWindow):
         self.mesh_edges_checkbox.toggled.connect(self.show_mesh_edges_action.setChecked)
         self.mesh_edge_opacity_slider.valueChanged.connect(self._mesh_edge_opacity_changed)
         self.show_entity_labels_action.toggled.connect(self._show_entity_labels_changed)
+        self.show_positions_action.toggled.connect(self._show_positions_changed)
         self.line_index_labels_action.triggered.connect(lambda: self._label_mode_changed("index"))
         self.type_labels_action.triggered.connect(lambda: self._label_mode_changed("type"))
+        self.play_pause_action = QAction("Play/pause", self)
+        self.play_pause_action.setShortcut("Ctrl+P")
+        self.play_pause_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.play_pause_action.setAutoRepeat(False)
+        self.play_pause_action.triggered.connect(
+            lambda: self.play_button.setChecked(not self.play_button.isChecked())
+        )
+        self.addAction(self.play_pause_action)
         self.play_button.toggled.connect(self._playback_toggled)
         self.heal_checkbox.toggled.connect(self._heal_changed)
         self.fast_preview_checkbox.toggled.connect(self._fast_preview_changed)
@@ -1602,6 +1671,7 @@ class MainWindow(QMainWindow):
         self._surface_control_status_labels = {}
         self.surface_control_sliders = {}
 
+    @timed("ui.surface_controls")
     def _update_surface_controls(self, snapshot):
         statuses = snapshot.control_net_statuses
         self._control_nets_by_id = {control_net.entity_id: control_net for control_net in snapshot.control_nets}
@@ -1666,6 +1736,13 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         viewport_widget = getattr(self.viewport, "widget", None)
+        if (watched in {self.viewport, viewport_widget}
+                and getattr(self.viewport, "playback_locked", False) is True
+                and event.type() in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease}):
+            if event.key() == Qt.Key.Key_P and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                return False  # Let the application-wide play/pause shortcut handle it.
+            event.accept()
+            return True
         if watched is viewport_widget and event.type() == QEvent.Type.Resize:
             self._position_canvas_overlays()
         if watched in {self.viewport, viewport_widget} and event.type() == QEvent.Type.KeyPress:
@@ -1675,10 +1752,6 @@ class MainWindow(QMainWindow):
                 | Qt.KeyboardModifier.MetaModifier
             ):
                 return super().eventFilter(watched, event)
-            if event.key() == Qt.Key.Key_Space:
-                self.play_button.setChecked(not self.play_button.isChecked())
-                event.accept()
-                return True
             if event.key() == Qt.Key.Key_H:
                 self._show_hotkey_help()
                 event.accept()
@@ -1707,6 +1780,8 @@ class MainWindow(QMainWindow):
         if canvas is None:
             return
         margin = 14
+        if not self.paused_preview_panel.isHidden():
+            self._layout_paused_preview()
         if self.shape_expectation_label.parentWidget() is canvas and self.shape_expectation_label.isVisible():
             self.shape_expectation_label.adjustSize()
             self.shape_expectation_label.move(
@@ -1731,6 +1806,32 @@ class MainWindow(QMainWindow):
             self.hotkey_legend.adjustSize()
             self.hotkey_legend.move(margin, hotkey_top)
             self.hotkey_legend.raise_()
+
+    def _layout_paused_preview(self):
+        canvas = self.paused_preview_panel.parentWidget()
+        margin = 14
+        width = max(1, min(canvas.width() - 2 * margin, round(canvas.width() * 0.39)))
+        height = max(1, min(canvas.height() - 2 * margin, round(canvas.height() * 0.39)))
+        self.paused_preview_panel.setGeometry(
+            max(0, canvas.width() - width - margin), max(0, canvas.height() - height - margin), width, height
+        )
+        target = (max(1, width - 12), max(1, height - self.paused_preview_caption.sizeHint().height() - 15))
+        if self._paused_preview_pixmap is not None and target != self._paused_preview_size:
+            self.paused_preview_image.setPixmap(self._paused_preview_pixmap.scaled(
+                *target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            ))
+            self._paused_preview_size = target
+        self.paused_preview_panel.raise_()
+
+    def _show_paused_preview(self, image):
+        if image is None or image.isNull():
+            self.paused_preview_panel.hide()
+            return
+        self._paused_preview_pixmap = QPixmap.fromImage(image)
+        self._paused_preview_size = None
+        self.paused_preview_caption.setText(f"Last paused view · step {self.playback_order + 1:,}")
+        self._layout_paused_preview()
+        self.paused_preview_panel.show()
 
     def _show_hotkey_help(self):
         self.hotkey_fade.stop()
@@ -1830,27 +1931,49 @@ class MainWindow(QMainWindow):
             else "QFrame#playControl { background: #20242a; border: 1px solid #454c55; border-radius: 5px; }"
         )
 
+    def _set_playback_navigation_locked(self, locked: bool):
+        self.viewport.set_playback_locked(locked)
+        if locked and getattr(self.viewport, "widget", None) is not None:
+            self.viewport.widget.setFocus(Qt.FocusReason.OtherFocusReason)
+        for control in (self.reset_view_button, self.fit_view_button, self.projection_mode,
+                        self.reset_view_action, self.fit_view_action):
+            control.setEnabled(not locked)
+        self.focus_face_button.setEnabled(not locked and self.viewport.has_rendered_face(self.current_id))
+
     def _playback_toggled(self, playing: bool):
         if not playing:
+            self.paused_preview_panel.hide()
+            self._set_playback_navigation_locked(False)
             self._last_playback_step_finished = None
             self.playback_timer.stop()
             self.play_button.setText("Play")
+            flushed = self._flush_playback_updates(incremental=False)
+            if not flushed and self.current_snapshot is not None:
+                if self.playback_progress.value() != self.playback_order:
+                    self._present_playback_order(self.current_snapshot, incremental=False)
+                else:
+                    self._show_snapshot(self.current_snapshot, self.current_id, update_surface_controls=False)
             return
         if not self.document or not self.document.entities:
             self.play_button.setChecked(False)
             return
         if self.playback_speed == 0:
             self.playback_speed_slider.setValue(1)
+        # Capture before confirmation or mode changes can hide the paused markers.
+        paused_image = self.viewport.capture_frame()
         at_end = self.playback_order >= len(self.document.entities) - 1
         if not self._confirm_playback_duration(0 if at_end else self.playback_order):
             self.play_button.setChecked(False)
             return
         self.mode.setCurrentText("Playback")
+        self._show_paused_preview(paused_image)
         if at_end:
             self._set_playback_order(0)
         else:
             self.tree.focus_playback_entity(self.document.entities[self.playback_order].entity_id)
         self._last_playback_step_finished = monotonic()
+        self._last_playback_presented_at = monotonic()
+        self._set_playback_navigation_locked(True)
         self.playback_timer.start()
         self.play_button.setText("Pause")
 
@@ -1873,7 +1996,7 @@ class MainWindow(QMainWindow):
         )
         if estimate.seconds <= PLAYBACK_ESTIMATE_WARN_SECONDS:
             return True
-        if self._playback_estimate_acknowledged():
+        if self._playback_duration_confirmed or self._playback_estimate_acknowledged():
             return True
         message = describe_playback_estimate(
             estimate, turbo=self.fast_preview_checkbox.isChecked()
@@ -1890,40 +2013,76 @@ class MainWindow(QMainWindow):
         yes.setText("Continue anyway")
         answer.exec()
         acknowledged = answer.clickedButton() is yes
+        if acknowledged:
+            self._playback_duration_confirmed = True
+            self.show_positions_action.setChecked(False)
         if acknowledged and acknowledge.isChecked():
             self.settings.setValue(self._playback_estimate_ack_key(), True)
             self.settings.sync()
         return acknowledged
 
+    def _clear_playback_updates(self):
+        self._pending_playback_snapshot = None
+        self._pending_playback_updates = {}
+        self._pending_playback_full_redraw = False
+
+    def closeEvent(self, event):
+        # Closing must not generate an expensive paused inspection frame.
+        self.playback_timer.stop()
+        self._clear_playback_updates()
+        super().closeEvent(event)
+
+    def _playback_present_interval(self):
+        if len(self.document.entities) >= self.HEAVY_PLAYBACK_ENTITY_COUNT:
+            return self.HEAVY_PLAYBACK_PRESENT_INTERVAL_SECONDS
+        return self.FAST_PREVIEW_PRESENT_INTERVAL_SECONDS
+
+    def _queue_playback_update(self, snapshot):
+        self._pending_playback_snapshot = snapshot
+        if snapshot.render_updates is None:
+            self._pending_playback_full_redraw = True
+        else:
+            self._pending_playback_updates.update(snapshot.render_updates)
+
+    def _flush_playback_updates(self, *, incremental=True):
+        snapshot = self._pending_playback_snapshot
+        if snapshot is None:
+            return False
+        full_redraw = self._pending_playback_full_redraw
+        snapshot = replace(snapshot, render_updates=None if full_redraw else self._pending_playback_updates)
+        self._clear_playback_updates()
+        self._present_playback_order(snapshot, incremental=incremental and not full_redraw)
+        self._last_playback_presented_at = monotonic()
+        return True
+
+    @timed("playback.tick")
     def _playback_tick(self):
         if not self.document or self.playback_order >= len(self.document.entities) - 1:
             self.play_button.setChecked(False)
             return
         previous_finished = self._last_playback_step_finished
+        presented = True
         if self.fast_preview_checkbox.isChecked():
             start_order = self.playback_order
             target_order = min(
                 len(self.document.entities) - 1,
                 start_order + self.FAST_PREVIEW_BATCH_SIZE,
             )
-            pending_updates = {}
-            snapshot = None
             batch_started = monotonic()
             for order in range(start_order + 1, target_order + 1):
                 snapshot = self._set_playback_order(order, present=False)
-                if snapshot is not None and snapshot.render_updates is not None:
-                    pending_updates.update(snapshot.render_updates)
+                if snapshot is not None:
+                    self._queue_playback_update(snapshot)
                 if monotonic() - batch_started >= self.FAST_PREVIEW_BATCH_BUDGET_SECONDS:
                     break
-            if snapshot is not None:
-                # A batched render must include every visual change accumulated
-                # since the last viewport refresh, not just the final entity.
-                snapshot = replace(snapshot, render_updates=pending_updates)
-                self._present_playback_order(snapshot)
+            presented = False
+            if (self.playback_order >= len(self.document.entities) - 1
+                    or monotonic() - self._last_playback_presented_at >= self._playback_present_interval()):
+                presented = self._flush_playback_updates()
         else:
             self._set_playback_order(self.playback_order + 1)
         finished = monotonic()
-        if previous_finished is not None:
+        if presented and previous_finished is not None:
             entity = self.document.entities[self.playback_order]
             self.tree.set_playback_step_time(entity.entity_id, (finished - previous_finished) * 1000)
         self._last_playback_step_finished = finished
@@ -1934,20 +2093,23 @@ class MainWindow(QMainWindow):
         if self.document and self.document.entities and order != self.playback_order:
             self._set_playback_order(order)
 
+    @timed("playback.advance")
     def _set_playback_order(self, order: int, *, present: bool = True):
         if not self.document or not self.document.entities:
             return None
         step_started = monotonic()
         previous_order = self.playback_order
+        had_pending = self._pending_playback_snapshot is not None
+        if present:
+            self._clear_playback_updates()
         self.playback_order = max(0, min(len(self.document.entities) - 1, order))
-        forward_step = self.playback_order == previous_order + 1
-        self.playback_progress.blockSignals(True)
-        self.playback_progress.setValue(self.playback_order)
-        self.playback_progress.blockSignals(False)
+        forward_step = self.playback_order == previous_order + 1 and not had_pending
         entity = self.document.entities[self.playback_order]
         self.current_id = entity.entity_id
         self.discovered_order = self.playback_order
         builder = self.geometry_builder or GeometryBuilder(self.document)
+        performance_context(step=self.playback_order + 1, order=self.playback_order,
+                            entity_id=entity.entity_id, entity_type=entity.type_name)
         measure = self.playback_order not in self._timed_playback_orders and self._report_snapshot is None
         snapshot = builder.build(self.playback_order, measure_times=measure)
         if measure:
@@ -1963,14 +2125,19 @@ class MainWindow(QMainWindow):
                     )
         if not present:
             return snapshot
-        self.details.show_entity(entity, self.document)
-        self._update_face_analysis_actions(entity)
         self._present_playback_order(snapshot, incremental=forward_step)
         self.tree.set_playback_step_time(entity.entity_id, (monotonic() - step_started) * 1000)
         return snapshot
 
+    @timed("ui.present")
     def _present_playback_order(self, snapshot, *, incremental: bool = True):
         entity = self.document.entities[self.playback_order]
+        performance_context(presented_step=self.playback_order + 1)
+        self.playback_progress.blockSignals(True)
+        self.playback_progress.setValue(self.playback_order)
+        self.playback_progress.blockSignals(False)
+        self.details.show_entity(entity, self.document)
+        self._update_face_analysis_actions(entity)
         self._show_snapshot(
             snapshot,
             entity.entity_id,
@@ -2179,10 +2346,19 @@ class MainWindow(QMainWindow):
             return
         self.status.setText(f"Saved {count} geometry and supporting entities to {destination.name}")
 
+    @timed("ui.open_file")
     def open_path(self, path: str):
         self.play_button.setChecked(False)
         try:
-            self.document = StepDocument.from_file(path)
+            performance_context(source=str(path))
+            with span("parse.document"):
+                self.document = StepDocument.from_file(path)
+            self._playback_duration_confirmed = False
+            self._clear_playback_updates()
+            self.paused_preview_panel.hide()
+            self._paused_preview_pixmap = None
+            self._paused_preview_size = None
+            self.paused_preview_image.clear()
         except Exception as exc:
             QMessageBox.critical(self, "Could not parse STEP file", str(exc))
             return

@@ -1,6 +1,8 @@
 """Understand a useful, deliberately small subset of STEP geometry/topology."""
 
 from bisect import bisect_right
+from step_explorer.performance import timed
+
 from dataclasses import dataclass, field, replace
 from itertools import permutations
 import math
@@ -476,6 +478,7 @@ class GeometryBuilder:
         scale = scales.pop() if len(scales) == 1 else None
         return scale if scale is not None else 1.0
 
+    @timed("geometry.build")
     def build(self, through_order: int | None = None, progress=None, measure_times: bool = False) -> GeometrySnapshot:
         if through_order is not None:
             through_order = max(-1, min(through_order, len(self.document.entities) - 1))
@@ -749,6 +752,7 @@ class GeometryBuilder:
         except ValueError:
             return None, ControlNetStatus(entity.entity_id, "invalid")
 
+    @timed("geometry.edges")
     def _edge_points(self, entity: StepEntity, snapshot: GeometrySnapshot) -> tuple[Point3, ...]:
         refs = [_ref(item) for item in entity.arguments if _ref(item) is not None][:2]
         points = tuple(snapshot.point_for(item) for item in refs if item is not None and snapshot.point_for(item) is not None)
@@ -1447,6 +1451,7 @@ class GeometryBuilder:
             ]
         return FaceAssessment(category, tuple(reasons), surface_type)
 
+    @timed("geometry.face_lookup")
     def _face_mesh(self, entity: StepEntity, snapshot: GeometrySnapshot, visible: dict[int, StepEntity]) -> Mesh | None:
         if not self._face_dependencies_complete(entity, snapshot, visible):
             return None
@@ -1635,6 +1640,7 @@ class GeometryBuilder:
                     pending.append(dependency)
         return tuple(sorted(visited))
 
+    @timed("geometry.tessellate")
     def _face_mesh_impl(self, entity: StepEntity, snapshot: GeometrySnapshot, visible: dict[int, StepEntity]) -> Mesh | None:
         # AP203's ADVANCED_FACE has a bounds aggregate and a surface reference.
         surface_id = next((_ref(item) for item in entity.arguments if _ref(item) is not None), None)

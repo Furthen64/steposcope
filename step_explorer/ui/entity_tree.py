@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from step_explorer.performance import timed
+
 from .colors import category_for_entity, color_for_depth
 from .step_lines import step_line_appearance
 
@@ -121,6 +123,7 @@ class EntityTree(QTreeWidget):
             item.setText(3, f"{elapsed_ms:.2f}{suffix}")
             item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
+    @timed("ui.tree_focus")
     def focus_playback_entity(self, entity_id: int) -> None:
         item = self.playback_items.get(entity_id)
         if item is not None:

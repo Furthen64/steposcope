@@ -213,7 +213,13 @@ def test_report_button_requires_completed_file_and_copies_report(qapp, monkeypat
         window.close()
 
 
-def test_playback_duration_gate_warns_cancels_and_snoozes(qapp, monkeypatch):
+def test_playback_duration_gate_warns_cancels_and_snoozes(qapp, monkeypatch, tmp_path):
+    from PySide6.QtCore import QSettings
+
+    monkeypatch.setattr(
+        main_window_module, "QSettings",
+        lambda *_: QSettings(str(tmp_path / "duration.ini"), QSettings.Format.IniFormat),
+    )
     window = MainWindow()
     try:
         source = ROOT / "tests/corpus/planar_only/box125.step"
@@ -224,6 +230,7 @@ def test_playback_duration_gate_warns_cancels_and_snoozes(qapp, monkeypatch):
 
         # Estimate far below the installed threshold: no dialog, play starts.
         assert window._confirm_playback_duration(0) is True
+        assert window.show_positions_action.isChecked()
 
         monkeypatch.setattr(main_window_module.QMessageBox, "exec", lambda self: None)
         monkeypatch.setattr(main_window_module.QMessageBox, "clickedButton",
@@ -235,6 +242,7 @@ def test_playback_duration_gate_warns_cancels_and_snoozes(qapp, monkeypatch):
         assert not window.play_button.isChecked()
         assert not window.playback_timer.isActive()
         assert window.settings.value(key, False, type=bool) is False
+        assert window.show_positions_action.isChecked()
 
         monkeypatch.setattr(main_window_module.QMessageBox, "exec",
                             lambda self: self.checkBox().setChecked(True))
@@ -244,6 +252,9 @@ def test_playback_duration_gate_warns_cancels_and_snoozes(qapp, monkeypatch):
         assert window.play_button.isChecked()
         assert window.playback_timer.isActive()
         assert window.settings.value(key, False, type=bool) is True
+        assert not window.show_positions_action.isChecked()
+        assert not window.viewport._last_show_points
+        assert window.settings.value("show_positions", True, type=bool) is False
         window.play_button.setChecked(False)
 
         # Once acknowledged for the file, the gate stops asking.
@@ -258,4 +269,30 @@ def test_playback_duration_gate_warns_cancels_and_snoozes(qapp, monkeypatch):
     finally:
         window.settings.remove(window._playback_estimate_ack_key())
         window.settings.sync()
+        window.close()
+
+
+def test_continue_without_permanent_opt_out_is_remembered_until_next_open(qapp, monkeypatch, tmp_path):
+    from PySide6.QtCore import QSettings
+
+    monkeypatch.setattr(main_window_module, "QSettings",
+                        lambda *_: QSettings(str(tmp_path / 'session.ini'), QSettings.Format.IniFormat))
+    monkeypatch.setattr(main_window_module, 'PLAYBACK_ESTIMATE_WARN_SECONDS', -1)
+    shown = []
+    monkeypatch.setattr(QMessageBox, 'exec', lambda dialog: shown.append(True))
+    monkeypatch.setattr(QMessageBox, 'clickedButton', lambda dialog: dialog.button(QMessageBox.StandardButton.Yes))
+    window = MainWindow()
+    try:
+        source = str(ROOT / 'tests/corpus/planar_only/box125.step')
+        window.open_path(source)
+        assert window._confirm_playback_duration(0)
+        assert window._confirm_playback_duration(0)
+        assert len(shown) == 1
+        assert not window._playback_estimate_acknowledged()
+        assert not window.show_positions_action.isChecked()
+        assert window.viewport._last_show_points  # Paused preview remains inspectable.
+        window.open_path(source)
+        assert window._confirm_playback_duration(0)
+        assert len(shown) == 2
+    finally:
         window.close()

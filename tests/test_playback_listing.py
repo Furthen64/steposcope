@@ -2,7 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication, QComboBox
 
 from step_explorer.step.parser import parse_step
@@ -29,8 +29,14 @@ def _face_document():
     )
 
 
-def test_turbo_keeps_paused_and_early_point_only_preview_visible(qapp):
+def test_positions_stay_visible_in_turbo_and_can_be_toggled_independently(qapp, tmp_path, monkeypatch):
+    settings_path = tmp_path / 'positions.ini'
+    monkeypatch.setattr(
+        'step_explorer.ui.main_window.QSettings',
+        lambda *_: QSettings(str(settings_path), QSettings.Format.IniFormat),
+    )
     window = MainWindow()
+    assert window.show_positions_action.isChecked()
     window.fast_preview_checkbox.setChecked(False)
     source = Path(__file__).resolve().parents[1] / "tests/corpus/planar_only/multiple_cubes.step"
     window.open_path(str(source))
@@ -51,9 +57,25 @@ def test_turbo_keeps_paused_and_early_point_only_preview_visible(qapp):
     first_face = next(entity for entity in window.document.entities if entity.type_name == "ADVANCED_FACE")
     window._set_playback_order(first_face.order)
     assert window.current_snapshot.faces
+    assert window.viewport._last_show_points
+
+    window.show_positions_action.setChecked(False)
     assert not window.viewport._last_show_points
+    assert window.viewport._last_fast_preview
     window.play_button.setChecked(False)
+    window.fast_preview_checkbox.setChecked(False)
+    window._show_snapshot(window.current_snapshot, window.current_id, update_surface_controls=False)
+    assert window.viewport._last_show_points  # Paused inspection restores markers.
+    assert not window.show_positions_action.isChecked()
+    window.show_positions_action.setChecked(True)
+    assert window.viewport._last_show_points
+    window.show_positions_action.setChecked(False)
     window.close()
+
+    restored = MainWindow()
+    assert not restored.show_positions_action.isChecked()
+    assert not restored.show_positions
+    restored.close()
 
 
 def test_playback_listing_shows_every_record_in_file_order(monkeypatch):
@@ -127,6 +149,9 @@ def test_play_switches_to_playback_listing(monkeypatch):
         playback_timer=SimpleNamespace(start=Mock()),
         play_button=SimpleNamespace(setText=Mock()),
         _confirm_playback_duration=lambda start_order: True,
+        _set_playback_navigation_locked=Mock(),
+        viewport=SimpleNamespace(capture_frame=Mock(return_value=None)),
+        _show_paused_preview=Mock(),
     )
 
     MainWindow._playback_toggled(window, True)
