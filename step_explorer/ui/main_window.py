@@ -9,7 +9,9 @@ from ..config import AppConfig, load_config
 from ..geometry import GeometryBuilder, GeometrySnapshot, save_mesh_as_obj, save_mesh_as_stl
 from ..geometry.completeness import assess_completeness, find_face_preview_gaps
 from ..llm_report import (
-    analyze_processing_pain, build_llm_report, preview_health_score, report_red_reasons,
+    PLAYBACK_ESTIMATE_WARN_SECONDS,
+    analyze_processing_pain, build_llm_report, describe_playback_estimate,
+    estimate_playback_duration, preview_health_score, report_red_reasons,
 )
 from ..step.parser import StepDocument
 from ..step.export import save_geometry_only_step
@@ -1833,14 +1835,59 @@ class MainWindow(QMainWindow):
             return
         if self.playback_speed == 0:
             self.playback_speed_slider.setValue(1)
+        at_end = self.playback_order >= len(self.document.entities) - 1
+        if not self._confirm_playback_duration(0 if at_end else self.playback_order):
+            self.play_button.setChecked(False)
+            return
         self.mode.setCurrentText("Playback")
-        if self.playback_order >= len(self.document.entities) - 1:
+        if at_end:
             self._set_playback_order(0)
         else:
             self.tree.focus_playback_entity(self.document.entities[self.playback_order].entity_id)
         self._last_playback_step_finished = monotonic()
         self.playback_timer.start()
         self.play_button.setText("Pause")
+
+    def _playback_estimate_ack_key(self) -> str:
+        path = getattr(self, "source_path", "")
+        resolved = Path(path).expanduser().resolve() if path else Path(".")
+        return f"playback_estimate_ack/{resolved}"
+
+    def _playback_estimate_acknowledged(self) -> bool:
+        key = self._playback_estimate_ack_key()
+        return bool(self.settings.value(key, False, type=bool))
+
+    def _confirm_playback_duration(self, start_order: int) -> bool:
+        """Gate a play-through that may take hours, with a per-file opt-out."""
+
+        estimate = estimate_playback_duration(
+            self.document,
+            interval_ms=self._playback_interval(),
+            start_order=start_order,
+        )
+        if estimate.seconds <= PLAYBACK_ESTIMATE_WARN_SECONDS:
+            return True
+        if self._playback_estimate_acknowledged():
+            return True
+        message = describe_playback_estimate(
+            estimate, turbo=self.fast_preview_checkbox.isChecked()
+        )
+        answer = QMessageBox(self)
+        answer.setIcon(QMessageBox.Icon.Warning)
+        answer.setWindowTitle("This may take a while")
+        answer.setText(message)
+        acknowledge = QCheckBox("Do not ask again for this file")
+        answer.setCheckBox(acknowledge)
+        answer.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        answer.setDefaultButton(QMessageBox.StandardButton.No)
+        yes = answer.button(QMessageBox.StandardButton.Yes)
+        yes.setText("Continue anyway")
+        answer.exec()
+        acknowledged = answer.clickedButton() is yes
+        if acknowledged and acknowledge.isChecked():
+            self.settings.setValue(self._playback_estimate_ack_key(), True)
+            self.settings.sync()
+        return acknowledged
 
     def _playback_tick(self):
         if not self.document or self.playback_order >= len(self.document.entities) - 1:

@@ -1,6 +1,6 @@
 from step_explorer.visualization.vtk_view import VtkView
 from step_explorer.visualization.vtk_view import vtk
-from step_explorer.geometry.builder import Point3
+from step_explorer.geometry.builder import Mesh, Point3
 from step_explorer.ui.main_window import MainWindow
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -33,6 +33,33 @@ def test_enabling_autozoom_requests_a_camera_fit():
 
     assert view.autozoom is True
     assert view._fit_camera_on_next_render is True
+
+
+def test_fit_uses_visible_face_triangles_instead_of_distant_points():
+    view = VtkView.__new__(VtkView)
+    view.renderer = Mock()
+    face = Mesh(7, (Point3(0, 0, 0), Point3(2, 0, 0), Point3(0, 4, 0),
+                    Point3(1000, 1000, 1000)), ((0, 1, 2),))
+    hidden = Mesh(8, (Point3(500, 500, 500),) * 3, ((0, 1, 2),))
+    view._last_snapshot = SimpleNamespace(faces=[face, hidden])
+    view._face_actors = {7: Mock(), 8: Mock()}
+    view._face_actors[7].GetVisibility.return_value = True
+    view._face_actors[8].GetVisibility.return_value = False
+
+    view._fit_rendered_faces()
+
+    view.renderer.ResetCamera.assert_called_once_with((0, 2, 0, 4, 0, 0))
+
+
+def test_fit_falls_back_to_scene_without_visible_faces():
+    view = VtkView.__new__(VtkView)
+    view.renderer = Mock()
+    view._last_snapshot = SimpleNamespace(faces=[])
+    view._face_actors = {}
+
+    view._fit_rendered_faces()
+
+    view.renderer.ResetCamera.assert_called_once_with()
 
 
 @pytest.mark.parametrize("key,method", [(Qt.Key.Key_R, "reset_camera"), (Qt.Key.Key_F, "fit_camera")])

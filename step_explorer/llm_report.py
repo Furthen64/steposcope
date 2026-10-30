@@ -29,6 +29,38 @@ PAIN_PENALTY_PER_TEN_PERCENT = 500
 POINT_PENALTY_PER_ENTITY = 10
 
 
+# Playback difficulty gate. Uses only information available before any
+# geometry is built, so the same linear cost model never sees a real handler
+# time - treat the estimate as an order of magnitude, not a stopwatch.
+PLAYBACK_STEP_FLOOR_SECONDS = 0.01
+PLAYBACK_SURFACE_SECONDS_PER_CONTROL_REF = (
+    FACE_PROCESSING_LIMIT_SECONDS / SURFACE_CONTROL_LIMIT
+)
+PLAYBACK_EDGE_SECONDS_PER_CONTROL_REF = 0.002
+PLAYBACK_ESTIMATE_WARN_SECONDS = 30 * 60
+
+
+@dataclass(frozen=True)
+class DifficultyEstimate:
+    remaining_entities: int
+    step_cost_seconds: float
+    baseline_seconds: float
+    surface_seconds: float
+    edge_seconds: float
+    dense_surfaces: int
+    dense_edges: int
+    max_surface_refs: int
+    max_edge_refs: int
+
+    @property
+    def heavy_seconds(self) -> float:
+        return self.surface_seconds + self.edge_seconds
+
+    @property
+    def seconds(self) -> float:
+        return self.baseline_seconds + self.heavy_seconds
+
+
 @dataclass(frozen=True)
 class PainAnalysis:
     score: int
@@ -139,12 +171,12 @@ def preview_health_deductions(
     if topology.face_count:
         missing = topology.face_count - topology.meshed_face_count
         if missing:
-            points = min(30, round(30 * missing / topology.face_count))
+            points = max(1, round(100 * missing / topology.face_count))
             records.append(HealthDeduction(
                 points, f"{missing} face(s) lack a preview mesh",
                 f"missing {missing}/{topology.face_count} faces",
-                f"30 * {missing} / {topology.face_count} = "
-                f"{round(30 * missing / topology.face_count)}, capped at 30",
+                f"100 * {missing} / {topology.face_count} = "
+                f"{round(100 * missing / topology.face_count)}, minimum 1",
             ))
     else:
         records.append(HealthDeduction(
@@ -221,6 +253,135 @@ def penalty_score(
             f" = {penalty:,}",
         ))
     return sum(points for points, _ in contributions), contributions
+
+
+def long_playback_warning(document: StepDocument) -> str | None:
+    """One-line warning for non-interactive runs, or None below the threshold.
+
+    Headless runs tessellate everything once instead of playing entity by
+    entity, so the GUI gate never applies there; the estimate still reflects
+    the same body of geometry work.
+    """
+
+    estimate = estimate_playback_duration(document)
+    if estimate.seconds <= PLAYBACK_ESTIMATE_WARN_SECONDS:
+        return None
+    return (
+        f"large file: estimated interactive play-through {format_duration(estimate.seconds)} "
+        f"({estimate.remaining_entities:,} entities)."
+    )
+
+
+def format_duration(seconds: float) -> str:
+    """Render a rough duration as '45 s', '12 min' or '3 h 07 min'."""
+
+    whole = max(0, int(round(seconds)))
+    if whole < 60:
+        return f"{whole} s"
+    minutes = (whole + 30) // 60
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+def estimate_playback_duration(
+    document: StepDocument,
+    *,
+    interval_ms: float = 0.0,
+    start_order: int = 0,
+) -> DifficultyEstimate:
+    """Estimate play-through time from parse data only, before any meshing.
+
+    Cost model, auditable per step:
+    - every entity costs at least its timer interval, floored at
+      PLAYBACK_STEP_FLOOR_SECONDS of timer/UI overhead per step;
+    - every control point of a B-spline surface costs
+      PLAYBACK_SURFACE_SECONDS_PER_CONTROL_REF (the linear form of the
+      FACE_PROCESSING_LIMIT_SECONDS / SURFACE_CONTROL_LIMIT pain limit);
+    - every control/cartesian point referenced by an EDGE_CURVE's dense
+      B-spline curve or a POLYLINE costs PLAYBACK_EDGE_SECONDS_PER_CONTROL_REF.
+    """
+
+    end = max(0, len(document.entities) - 1)
+    begin = max(0, min(start_order, end))
+    remaining = end - begin
+    step_cost = max(PLAYBACK_STEP_FLOOR_SECONDS, max(0.0, interval_ms) / 1000.0)
+    baseline_seconds = remaining * step_cost
+
+    surface_seconds = edge_seconds = 0.0
+    dense_surfaces = dense_edges = 0
+    max_surface_refs = max_edge_refs = 0
+    for entity in document.entities[begin:end + 1]:
+        grid = _control_grid(entity)
+        if grid is not None:
+            refs = grid[0] * grid[1]
+            max_surface_refs = max(max_surface_refs, refs)
+            surface_seconds += refs * PLAYBACK_SURFACE_SECONDS_PER_CONTROL_REF
+            if refs > SURFACE_CONTROL_LIMIT:
+                dense_surfaces += 1
+            continue
+        points = _dense_curve_points(document, entity)
+        if points:
+            max_edge_refs = max(max_edge_refs, points)
+            edge_seconds += points * PLAYBACK_EDGE_SECONDS_PER_CONTROL_REF
+            if points > EDGE_CONTROL_LIMIT:
+                dense_edges += 1
+    return DifficultyEstimate(
+        remaining_entities=remaining,
+        step_cost_seconds=step_cost,
+        baseline_seconds=baseline_seconds,
+        surface_seconds=surface_seconds,
+        edge_seconds=edge_seconds,
+        dense_surfaces=dense_surfaces,
+        dense_edges=dense_edges,
+        max_surface_refs=max_surface_refs,
+        max_edge_refs=max_edge_refs,
+    )
+
+
+def _dense_curve_points(document: StepDocument, entity) -> int:
+    """Control-point count behind POLYLINE entities and EDGE_CURVE spline curves."""
+
+    if entity.type_name.upper() == "POLYLINE" and len(entity.arguments) > 1:
+        points = entity.arguments[1]
+        return len(points.values) if isinstance(points, StepAggregate) else 0
+    if entity.type_name.upper() != "EDGE_CURVE" or len(entity.arguments) < 4:
+        return 0
+    curve_ref = entity.arguments[3]
+    curve = document.entity(curve_ref.entity_id) if isinstance(curve_ref, StepReference) else None
+    if curve is None or curve.type_name.upper() != "B_SPLINE_CURVE_WITH_KNOTS" or len(curve.arguments) < 3:
+        return 0
+    controls = curve.arguments[2]
+    return len(controls.values) if isinstance(controls, StepAggregate) else 0
+
+
+def describe_playback_estimate(estimate: DifficultyEstimate, *, turbo: bool = False) -> str:
+    """Human-readable, itemized warning text for the playback gate dialog."""
+
+    lines = [
+        f"Estimated play-through: {format_duration(estimate.seconds)}.",
+        f" - baseline: {estimate.remaining_entities:,} entities x "
+        f"{estimate.step_cost_seconds:.2f} s per step = "
+        f"{format_duration(estimate.baseline_seconds)}",
+    ]
+    heavy: list[str] = []
+    if estimate.surface_seconds:
+        detail = (f"{estimate.dense_surfaces:,} of {estimate.remaining_entities:,} "
+                  f"surface(s) over {SURFACE_CONTROL_LIMIT:,} control points; "
+                  f"largest grid {estimate.max_surface_refs:,} points")
+        heavy.append(detail)
+    if estimate.edge_seconds:
+        detail = (f"{estimate.dense_edges:,} dense curve(s); "
+                  f"largest uses {estimate.max_edge_refs:,} points")
+        heavy.append(detail)
+    if heavy:
+        lines.append(f" - dense geometry adds ~{format_duration(estimate.heavy_seconds)}: "
+                     + "; ".join(heavy))
+    if turbo:
+        lines.append(" - Turbo batches rendering, but estimate still assumes every "
+                     "entity's geometry is computed once.")
+    lines.append("Heuristic estimate from file content; actual time varies by machine.")
+    return "\n".join(lines)
 
 
 def _control_grid(entity) -> tuple[int, int] | None:

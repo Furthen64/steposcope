@@ -1,15 +1,45 @@
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QDialog, QPlainTextEdit, QPushButton
+from pytest import approx
 
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPlainTextEdit, QPushButton
+
+import step_explorer.llm_report as llm_report_module
+import step_explorer.ui.main_window as main_window_module
 from step_explorer.geometry.builder import GeometryBuilder
-from step_explorer.llm_report import analyze_processing_pain, build_llm_report, preview_health_score
+from step_explorer.llm_report import (
+    PLAYBACK_STEP_FLOOR_SECONDS,
+    analyze_processing_pain, build_llm_report, describe_playback_estimate,
+    estimate_playback_duration, format_duration, long_playback_warning,
+    preview_health_score,
+)
 from step_explorer.step.parser import StepDocument, parse_step
 from step_explorer.ui.main_window import MainWindow
 from step_explorer.ui.object_tree import document_bodies
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_degree_angle_cones_and_unequal_periodic_cylinder_rims():
+    document = StepDocument.from_file(ROOT / "tests/corpus/subaru_degree_units.step")
+    snapshot = GeometryBuilder(document).build()
+    assert {mesh.entity_id for mesh in snapshot.faces} == {
+        entity.entity_id for entity in document.entities if entity.type_name == "ADVANCED_FACE"
+    }
+
+
+def test_missing_third_of_preview_makes_report_bad():
+    source = ROOT / "tests/corpus/subaru_degree_units.step"
+    document = StepDocument.from_file(source)
+    snapshot = GeometryBuilder(document).build()
+    snapshot.faces = snapshot.faces[:16]
+    score, deductions = preview_health_score(document, snapshot)
+    report = build_llm_report(source, document, snapshot)
+    assert score < 80
+    assert (33, "8 face(s) lack a preview mesh") in deductions
+    assert "[BAD]" in report
+    assert "Report button: RED" in report
 
 
 def test_report_explains_dense_spline_and_slow_face():
@@ -71,6 +101,79 @@ def test_dense_edge_controls_trigger_processing_pain():
     assert any("Polyline #302: 257 Cartesian-point references" in item for item in pain.warnings)
 
 
+SURFACE_REFERENCE = ("ISO-10303-21;DATA;"
+                     "#500=B_SPLINE_SURFACE_WITH_KNOTS('',1,3,{grid},"
+                     ".UNSPECIFIED.,.F.,.F.,.U.,(2,2),(4,4),(0.,1.),(0.,1.));"
+                     "#501=POLYLINE('',({curve}));"
+                     "ENDSEC;END-ISO-10303-21;")
+
+
+def test_playback_estimate_costs_entity_steps_and_dense_geometry():
+    surface_grid = "(" + ",".join(
+        "(" + ",".join("#1" for _ in range(44)) + ")" for _ in range(116)
+    ) + ")"
+    curve_refs = ",".join("#1" for _ in range(257))
+    document = parse_step(SURFACE_REFERENCE.format(grid=surface_grid, curve=curve_refs))
+    fastest = estimate_playback_duration(document)
+    assert fastest.step_cost_seconds == PLAYBACK_STEP_FLOOR_SECONDS
+    assert fastest.remaining_entities == 1  # the first entity is already shown
+    assert fastest.surface_seconds == approx(5104 * 0.002)
+    assert fastest.edge_seconds == approx(257 * 0.002)
+    assert fastest.dense_surfaces == 1
+    assert fastest.dense_edges == 1
+    assert fastest.max_surface_refs == 5104
+    assert fastest.max_edge_refs == 257
+    assert fastest.seconds == approx(fastest.baseline_seconds + 10.208 + 0.514)
+
+    slowed = estimate_playback_duration(document, interval_ms=100)
+    assert slowed.step_cost_seconds == 0.1
+    assert slowed.baseline_seconds == approx(0.1)
+    assert slowed.seconds == approx(slowed.surface_seconds + slowed.edge_seconds + 0.1)
+
+
+def test_playback_estimate_description_is_itemized():
+    surface_grid = "(" + ",".join(
+        "(" + ",".join("#1" for _ in range(44)) + ")" for _ in range(116)
+    ) + ")"
+    document = parse_step(SURFACE_REFERENCE.format(
+        grid=surface_grid, curve=",".join("#1" for _ in range(257))
+    ))
+    estimate = estimate_playback_duration(document, interval_ms=100)
+    text = describe_playback_estimate(estimate, turbo=True)
+    assert "Estimated play-through:" in text
+    assert "1 entities x 0.10 s per step = 0 s" in text
+    assert "largest grid 5,104 points" in text
+    assert "dense curve(s); largest uses 257 points" in text
+    assert "Turbo batches rendering" in text
+    assert "varies by machine" in text
+
+
+def test_format_duration_progresses_through_units():
+    assert format_duration(45.4) == "45 s"
+    assert format_duration(59.6) == "1 min"
+    assert format_duration(3 * 3600 + 7 * 60) == "3 h 07 min"
+
+
+def test_long_playback_warning_stays_quiet_below_threshold(monkeypatch):
+    document = parse_step(
+        "ISO-10303-21;DATA;"
+        "#600=B_SPLINE_CURVE_WITH_KNOTS('',3,(#1));"
+        "ENDSEC;END-ISO-10303-21;"
+    )
+    assert long_playback_warning(document) is None
+    surface_grid = "(" + ",".join(
+        "(" + ",".join("#1" for _ in range(44)) + ")" for _ in range(116)
+    ) + ")"
+    heavy = parse_step(SURFACE_REFERENCE.format(
+        grid=surface_grid, curve=",".join("#1" for _ in range(257))
+    ))
+    monkeypatch.setattr(llm_report_module, "PLAYBACK_ESTIMATE_WARN_SECONDS", 0.5)
+    warning = long_playback_warning(heavy)
+    assert warning is not None
+    assert "estimated interactive play-through" in warning
+    assert "1 entities" in warning
+
+
 def test_report_button_requires_completed_file_and_copies_report(qapp, monkeypatch):
     window = MainWindow()
     try:
@@ -107,4 +210,52 @@ def test_report_button_requires_completed_file_and_copies_report(qapp, monkeypat
         window.open_path(str(source))
         assert not window.llm_report_button.isEnabled()
     finally:
+        window.close()
+
+
+def test_playback_duration_gate_warns_cancels_and_snoozes(qapp, monkeypatch):
+    window = MainWindow()
+    try:
+        source = ROOT / "tests/corpus/planar_only/box125.step"
+        window.open_path(str(source))
+        key = window._playback_estimate_ack_key()
+        window.settings.remove(key)
+        window.settings.sync()
+
+        # Estimate far below the installed threshold: no dialog, play starts.
+        assert window._confirm_playback_duration(0) is True
+
+        monkeypatch.setattr(main_window_module.QMessageBox, "exec", lambda self: None)
+        monkeypatch.setattr(main_window_module.QMessageBox, "clickedButton",
+                            lambda self: self.button(QMessageBox.StandardButton.No))
+        window.settings.remove(key)
+        monkeypatch.setattr(main_window_module, "PLAYBACK_ESTIMATE_WARN_SECONDS", 60)
+        monkeypatch.setattr(llm_report_module, "PLAYBACK_STEP_FLOOR_SECONDS", 5)
+        window.play_button.setChecked(True)
+        assert not window.play_button.isChecked()
+        assert not window.playback_timer.isActive()
+        assert window.settings.value(key, False, type=bool) is False
+
+        monkeypatch.setattr(main_window_module.QMessageBox, "exec",
+                            lambda self: self.checkBox().setChecked(True))
+        monkeypatch.setattr(main_window_module.QMessageBox, "clickedButton",
+                            lambda self: self.button(QMessageBox.StandardButton.Yes))
+        window.play_button.setChecked(True)
+        assert window.play_button.isChecked()
+        assert window.playback_timer.isActive()
+        assert window.settings.value(key, False, type=bool) is True
+        window.play_button.setChecked(False)
+
+        # Once acknowledged for the file, the gate stops asking.
+        monkeypatch.setattr(main_window_module.QMessageBox, "exec",
+                            lambda self: 1 / 0)  # must never open again
+        monkeypatch.setattr(main_window_module.QMessageBox, "clickedButton",
+                            lambda self: 1 / 0)
+        window.play_button.setChecked(True)
+        assert window.play_button.isChecked()
+        assert window.playback_timer.isActive()
+        window.play_button.setChecked(False)
+    finally:
+        window.settings.remove(window._playback_estimate_ack_key())
+        window.settings.sync()
         window.close()

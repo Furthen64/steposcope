@@ -836,15 +836,28 @@ class VtkView(QWidget):
         self._fit_camera_on_next_render = True
 
     def fit_camera(self) -> None:
-        """Immediately frame the current scene and preserve that choice for a later render if needed."""
+        """Frame rendered faces, falling back to the scene when there are none."""
 
         self._fit_camera_on_next_render = True
         if self.renderer is None or not self._initialized:
             return
-        self.renderer.ResetCamera()
+        self._fit_rendered_faces()
         self._reset_clipping_range()
         self._fit_camera_on_next_render = False
         self.widget.GetRenderWindow().Render()
+
+    def _fit_rendered_faces(self) -> None:
+        points = []
+        if self._last_snapshot is not None:
+            for face in self._last_snapshot.faces:
+                actor = self._face_actors.get(face.entity_id)
+                if actor is not None and actor.GetVisibility():
+                    points.extend(face.points[index] for triangle in face.triangles for index in triangle)
+        bounds = self._bounds(points)
+        if bounds is None:
+            self.renderer.ResetCamera()
+        else:
+            self.renderer.ResetCamera(bounds)
 
     def fit_analysis_face(self) -> None:
         """Fit the analyzed mesh, or its control net/boundary when unmeshed."""
@@ -1279,7 +1292,7 @@ class VtkView(QWidget):
             )
         self._active_entity_id = None
         if (self.autozoom and not analysis_active) or self._fit_camera_on_next_render:
-            self.renderer.ResetCamera()
+            self._fit_rendered_faces()
             self._fit_camera_on_next_render = False
         self._reset_clipping_range()
         if labels or analysis_active:
@@ -1444,7 +1457,7 @@ class VtkView(QWidget):
 
         if ((self.autozoom and bounds_changed and self._analysis_face_id is None)
                 or self._fit_camera_on_next_render):
-            self.renderer.ResetCamera()
+            self._fit_rendered_faces()
             self._fit_camera_on_next_render = False
         self._reset_clipping_range()
         if faces_changed:

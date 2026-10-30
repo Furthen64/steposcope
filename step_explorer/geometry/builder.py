@@ -345,6 +345,7 @@ class GeometryBuilder:
 
     def __init__(self, document: StepDocument, *, heal_orientations: bool = True):
         self.document = document
+        self._angle_scale = self._document_angle_scale()
         self.heal_orientations = heal_orientations
         # Playback rebuilds progressively larger prefixes of the same STEP
         # document. Key successful tessellations by the visible part of their
@@ -355,6 +356,33 @@ class GeometryBuilder:
         self._prefix_heal = heal_orientations
         self._prefix_visible: dict[int, StepEntity] = {}
         self._prefix_snapshot: GeometrySnapshot | None = None
+
+    def _document_angle_scale(self) -> float:
+        """Use a common assigned angle unit; default to radians if ambiguous."""
+        scales = set()
+        for entity in self.document.entities:
+            for value in entity.arguments:
+                if not isinstance(value, StepComplexValue):
+                    continue
+                for component in value.components:
+                    if component.name.upper() != "GLOBAL_UNIT_ASSIGNED_CONTEXT":
+                        continue
+                    for unit_id in entity.references:
+                        unit = self.document.entity(unit_id)
+                        if unit is None or not unit.arguments or not isinstance(unit.arguments[0], StepComplexValue):
+                            continue
+                        parts = unit.arguments[0].components
+                        if not any(part.name.upper() == "PLANE_ANGLE_UNIT" for part in parts):
+                            continue
+                        conversion = next((part for part in parts if part.name.upper() == "CONVERSION_BASED_UNIT"), None)
+                        if conversion is None:
+                            scales.add(1.0)
+                        elif conversion.arguments and getattr(conversion.arguments[0], "value", "").upper() == "DEGREE":
+                            scales.add(math.pi / 180.0)
+                        else:
+                            scales.add(None)
+        scale = scales.pop() if len(scales) == 1 else None
+        return scale if scale is not None else 1.0
 
     def build(self, through_order: int | None = None, progress=None, measure_times: bool = False) -> GeometrySnapshot:
         if through_order is not None:
@@ -2915,7 +2943,7 @@ class GeometryBuilder:
         numbers = [_number(argument) for argument in surface.arguments if _number(argument) is not None]
         if len(numbers) < 2:
             return None
-        reference_radius, semi_angle = numbers[:2]
+        reference_radius, semi_angle = numbers[0], numbers[1] * self._angle_scale
         tangent = math.tan(semi_angle)
         if abs(tangent) <= 1e-12:
             return None
@@ -3346,7 +3374,17 @@ class GeometryBuilder:
                                   if abs(uv[i].x - umin) < 1e-7
                                   and uv[low[0]].y + 1e-7 < uv[i].y < uv[high[0]].y - 1e-7), None)
             if middle_height is None:
-                return None
+                # Two complete rims joined only by the seam form an ordinary
+                # periodic cylinder, even when their sample counts differ.
+                if any(uv[low[0]].y + 1e-7 < p.y < uv[high[0]].y - 1e-7 for p in uv):
+                    return None
+                if not stitch(low, high):
+                    return None
+                triangles = [tri for tri in triangles if abs(
+                    (uv[tri[1]].x - uv[tri[0]].x) * (uv[tri[2]].y - uv[tri[0]].y)
+                    - (uv[tri[1]].y - uv[tri[0]].y) * (uv[tri[2]].x - uv[tri[0]].x)
+                ) > 1e-10]
+                return (tuple(points), GeometryBuilder._consistent_uv_winding(tuple(uv), tuple(triangles))) if triangles else None
             inner = [i for i, p in enumerate(uv)
                      if uv[low[0]].y + 1e-7 < p.y < uv[high[0]].y - 1e-7
                      and p.x < umax - 1e-7]
@@ -3401,7 +3439,7 @@ class GeometryBuilder:
         numbers = [_number(argument) for argument in surface.arguments if _number(argument) is not None]
         if len(numbers) < 2:
             return None
-        reference_radius, semi_angle = numbers[:2]
+        reference_radius, semi_angle = numbers[0], numbers[1] * self._angle_scale
         tangent = math.tan(semi_angle)
         placement_id = next(
             (_ref(argument) for argument in surface.arguments if _ref(argument) is not None),
@@ -3801,7 +3839,7 @@ class GeometryBuilder:
                 target = radial
             elif surface_type == "CONICAL_SURFACE" and radial_unit:
                 numbers = [_number(arg) for arg in surface.arguments if _number(arg) is not None]
-                semi_angle = numbers[1] if len(numbers) > 1 else 0.0
+                semi_angle = numbers[1] * self._angle_scale if len(numbers) > 1 else 0.0
                 target = tuple(
                     math.cos(semi_angle) * radial_unit[index] - math.sin(semi_angle) * axis[index]
                     for index in range(3)

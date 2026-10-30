@@ -122,6 +122,11 @@ def _snapshots_main(argv: list[str]) -> int:
         document = StepDocument.from_file(source)
         from .geometry.builder import GeometryBuilder
 
+        from .llm_report import long_playback_warning
+
+        warning = long_playback_warning(document)
+        if warning:
+            print(f"steposcope: {source.name}: {warning}", file=sys.stderr)
         elements = collect_elements(document, GeometryBuilder(document).build())
         events = geometry_event_orders(elements)
         box = bounding_box(elements)

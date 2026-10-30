@@ -126,6 +126,7 @@ def test_play_switches_to_playback_listing(monkeypatch):
         playback_speed=100,
         playback_timer=SimpleNamespace(start=Mock()),
         play_button=SimpleNamespace(setText=Mock()),
+        _confirm_playback_duration=lambda start_order: True,
     )
 
     MainWindow._playback_toggled(window, True)

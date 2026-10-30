@@ -6,10 +6,12 @@ from collections import defaultdict
 from colorsys import hsv_to_rgb
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
 from .geometry.builder import GeometryBuilder, Mesh, Point3
+from .llm_report import long_playback_warning
 from .step.parser import StepDocument
 from .step.values import StepAggregate, StepEnumeration, StepReference
 
@@ -606,6 +608,9 @@ def process_file(
     t1 = time.time()
     if live:
         rep.done(f"read {source.name} ({len(document.entities)} entities)", t1 - t0)
+    warning = long_playback_warning(document)
+    if warning:
+        print(f"steposcope: {source.name}: {warning}", file=sys.stderr)
 
         rep.stage("tessellating")
     t2 = time.time()
