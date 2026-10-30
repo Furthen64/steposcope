@@ -81,8 +81,14 @@ def _label_for_entity_type(type_name: str) -> str:
 
 
 class MainWindow(QMainWindow):
-    FAST_PREVIEW_BATCH_SIZE = 8
-    FAST_PREVIEW_BATCH_BUDGET_SECONDS = 0.012
+    # Turbo batches consecutive playback steps between viewport refreshes.
+    # Entities in files like corpus/TOUGH_stresstests/AL39.STEP are dominated by
+    # cheap CARTESIAN_POINT/DIRECTION records, so a small cap would refresh the
+    # viewport after every 8 near-free steps. The cap stays high, while the time
+    # budget below keeps heavy faces from monopolizing the UI thread; either
+    # end of the loop stops the batch, whichever comes first.
+    FAST_PREVIEW_BATCH_SIZE = 256
+    FAST_PREVIEW_BATCH_BUDGET_SECONDS = 0.020
     NAVIGATION_PRESET_DEFAULTS = {
         "Blender": (False, True),
         "CAD": (True, False),
@@ -426,7 +432,7 @@ class MainWindow(QMainWindow):
         self.fast_preview_checkbox = QCheckBox("Turbo")
         self.fast_preview_checkbox.setChecked(self.settings.value("fast_preview", False, type=bool))
         self.fast_preview_checkbox.setToolTip(
-            "Set Max speed to 100%. Interpret up to 8 consecutive STEP entities or about 12 ms "
+            "Set Max speed to 100%. Interpret up to 256 consecutive STEP entities or about 20 ms "
             "of work per playback tick, "
             "then refresh the viewport once per batch. During playback, hide standalone point "
             "and vertex markers once other geometry appears, and hide triangle-edge overlays. "
