@@ -38,3 +38,6 @@ package = true
 # tool has created top-level output/, temp/, etc. alongside the real package.
 [tool.setuptools.packages.find]
 include = ["step_explorer", "step_explorer.*"]
+
+[tool.setuptools.data-files]
+"share/steposcope/media" = ["media/waiting.png", "media/result.png"]

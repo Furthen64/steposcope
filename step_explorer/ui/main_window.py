@@ -8,6 +8,7 @@ from pathlib import Path
 from time import monotonic
 
 from ..config import AppConfig, load_config
+from ..busy_indicator import BusyIndicator, busy_operation
 from ..geometry import GeometryBuilder, GeometrySnapshot, save_mesh_as_obj, save_mesh_as_stl
 from ..geometry.completeness import assess_completeness, find_face_preview_gaps
 from ..llm_report import (
@@ -549,6 +550,12 @@ class MainWindow(QMainWindow):
         self._build_file_menu()
         self._build_ui()
         self._connect_signals()
+        self._busy_indicator = BusyIndicator(enabled=QApplication.platformName() not in {"offscreen", "minimal"})
+        self._busy_heartbeat = QTimer(self)
+        self._busy_heartbeat.timeout.connect(self._busy_indicator.heartbeat)
+        if self._busy_indicator.enabled:
+            self._busy_indicator.heartbeat()
+            self._busy_heartbeat.start(250)
         QTimer.singleShot(150, self.viewport.reset_camera)
         if initial_path:
             self.open_path(initial_path)
@@ -1952,6 +1959,8 @@ class MainWindow(QMainWindow):
                     self._present_playback_order(self.current_snapshot, incremental=False)
                 else:
                     self._show_snapshot(self.current_snapshot, self.current_id, update_surface_controls=False)
+            if hasattr(self, '_busy_indicator'):
+                self._busy_indicator.send('end', key='playback', success=True)
             return
         if not self.document or not self.document.entities:
             self.play_button.setChecked(False)
@@ -1973,6 +1982,8 @@ class MainWindow(QMainWindow):
         self._last_playback_step_finished = monotonic()
         self._last_playback_presented_at = monotonic()
         self._set_playback_navigation_locked(True)
+        if hasattr(self, '_busy_indicator'):
+            self._busy_indicator.send('begin', key='playback', label='Processing STEP playback…')
         self.playback_timer.start()
         self.play_button.setText("Pause")
 
@@ -2029,6 +2040,9 @@ class MainWindow(QMainWindow):
         # Closing must not generate an expensive paused inspection frame.
         self.playback_timer.stop()
         self._clear_playback_updates()
+        if hasattr(self, '_busy_indicator'):
+            self._busy_heartbeat.stop()
+            self._busy_indicator.close()
         super().closeEvent(event)
 
     def _playback_present_interval(self):
@@ -2346,6 +2360,7 @@ class MainWindow(QMainWindow):
         self.status.setText(f"Saved {count} geometry and supporting entities to {destination.name}")
 
     @timed("ui.open_file")
+    @busy_operation("Loading STEP file…")
     def open_path(self, path: str):
         self.play_button.setChecked(False)
         try:
