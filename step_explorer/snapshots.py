@@ -414,7 +414,28 @@ def _arrow_actor(vtk, faces, arrow_length):
     actor.GetProperty().SetColor(1.0, 0.85, 0.15)
     actor.GetProperty().LightingOff()
     actor.SetPickable(False)
-    return actor
+    # Thin ring in the face plane marking each arrow's origin (matches VtkView).
+    ring = vtk.vtkCylinderSource()
+    ring.SetRadius(1.0)
+    ring.SetHeight(0.3)
+    ring.SetResolution(24)
+    ring.SetCapping(False)
+    base_glyph = vtk.vtkGlyph3D()
+    base_glyph.SetInputData(data)
+    base_glyph.SetSourceConnection(ring.GetOutputPort())
+    base_glyph.SetVectorModeToUseNormal()
+    base_glyph.SetScaleModeToScaleByVector()
+    base_glyph.SetScaleFactor(arrow_length * 0.3)
+    base_glyph.OrientOn()
+    base_mapper = vtk.vtkPolyDataMapper()
+    base_mapper.SetInputConnection(base_glyph.GetOutputPort())
+    base_actor = vtk.vtkActor()
+    base_actor.SetMapper(base_mapper)
+    base_actor.GetProperty().SetColor(1.0, 0.85, 0.15)
+    base_actor.GetProperty().SetOpacity(0.6)
+    base_actor.GetProperty().LightingOff()
+    base_actor.SetPickable(False)
+    return [actor, base_actor]
 
 
 def _caption_actor(vtk, text, width, height):
@@ -588,8 +609,7 @@ def render_frame(
     for mesh in snapshot.faces:
         renderer.AddActor(_mesh_actor(vtk, mesh))
     if show_arrows:
-        actor = _arrow_actor(vtk, snapshot.faces, arrow_length)
-        if actor is not None:
+        for actor in _arrow_actor(vtk, snapshot.faces, arrow_length) or []:
             renderer.AddActor(actor)
 
     _set_camera(renderer, box, camera)

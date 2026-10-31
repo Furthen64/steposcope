@@ -137,11 +137,13 @@ def test_normal_vectors_add_directional_arrows(view):
 
     view._add_mesh(mesh, selected=False, labels=False, label_scale=1.0, label_text="")
 
-    assert len(view._actors) == 2
+    assert len(view._actors) == 3
     mapper = view._actors[1].GetMapper()
     mapper.Update()
     assert mapper.GetInput().GetNumberOfPoints() > 0
     assert mapper.GetInput().GetBounds()[5] == pytest.approx(1.0)
+    base_property = view._actors[2].GetProperty()
+    assert base_property.GetOpacity() < 1.0
 
 
 def test_normal_arrow_limit_is_distributed_across_faces():

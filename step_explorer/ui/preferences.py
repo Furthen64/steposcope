@@ -300,7 +300,7 @@ class PreferencesDialog(QDialog):
             window._set_background_color(config.background_color)
             self._refresh_color_button(self.background_color, window.background_color)
             self.mesh_edges_check.setChecked(False)
-            self.edge_opacity.setValue(60)
+            self.edge_opacity.setValue(30)
             self.normal_display.setCurrentText("Hidden")
             self.arrow_limit.setValue(VtkView.DEFAULT_NORMAL_ARROW_LIMIT)
             self.face_colors.setCurrentText("normals")

@@ -121,7 +121,7 @@ class MainWindow(QMainWindow):
         self.show_xyz_origin = self._load_show_xyz_origin()
         self.show_xy_grid = self._load_show_xy_grid()
         self.show_mesh_edges = bool(self.settings.value("show_mesh_edges", False, type=bool))
-        self.mesh_edge_opacity = max(0, min(100, self.settings.value("mesh_edge_opacity", 60, type=int)))
+        self.mesh_edge_opacity = max(0, min(100, self.settings.value("mesh_edge_opacity", 30, type=int)))
         self.xy_grid_color = self._load_xy_grid_color()
         self.background_color = self._load_background_color()
         self.xy_grid_scale = self._load_xy_grid_scale()

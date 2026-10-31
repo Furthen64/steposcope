@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 from step_explorer.geometry.builder import ControlNet, GeometryBuilder, Mesh, Point3
 from step_explorer.step.parser import StepDocument
 from step_explorer.ui.main_window import MainWindow
-from step_explorer.visualization.vtk_view import _orbit_position
+from step_explorer.visualization.vtk_view import VtkView, _orbit_position
 
 
 def test_turntable_orbit_preserves_target_radius_and_world_up():
@@ -125,12 +125,16 @@ def test_face_analysis_opacity_and_normal_length_affect_actors(view):
 
     view._add_mesh(mesh, selected=False, labels=False, label_scale=1.0, label_text="", highlighted=True)
 
-    assert len(view._actors) == 2
+    assert len(view._actors) == 3
     assert view._actors[0].GetProperty().GetOpacity() == pytest.approx(0.25)
     assert view._actors[0].GetProperty().GetEdgeVisibility()
     mapper = view._actors[1].GetMapper()
     mapper.Update()
     assert mapper.GetInput().GetBounds()[5] == pytest.approx(2.0)
+    assert view._analysis_normal_base_glyph is not None
+    assert view._analysis_normal_base_glyph.GetScaleFactor() == pytest.approx(
+        VtkView.NORMAL_BASE_RING_RATIO * 2.0,
+    )
 
     view._analysis_context_opacity = 0.0
     view._add_polyline(8, mesh.points, False, "Geometry", False, 1.0, "", dimmed=True)

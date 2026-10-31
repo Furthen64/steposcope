@@ -138,7 +138,7 @@ def test_each_preferences_page_resets_live_controls_and_saved_settings(qapp, tmp
     assert dialog.grid_scale.value() == 2.5
     assert dialog.grid_color.text() == "#123456"
     assert dialog.background_color.text() == "#345678"
-    assert not dialog.mesh_edges_check.isChecked() and dialog.edge_opacity.value() == 60
+    assert not dialog.mesh_edges_check.isChecked() and dialog.edge_opacity.value() == 30
     assert dialog.normal_display.currentText() == "Hidden"
     assert dialog.arrow_limit.value() == 48
     assert dialog.face_colors.currentText() == "normals"

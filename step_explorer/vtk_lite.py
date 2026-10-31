@@ -31,6 +31,7 @@ from vtkmodules.vtkFiltersGeneral import vtkContourTriangulator
 from vtkmodules.vtkFiltersSources import (
     vtkArrowSource,
     vtkCubeSource,
+    vtkCylinderSource,
     vtkLineSource,
     vtkOutlineSource,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "vtkCellPicker",
     "vtkContourTriangulator",
     "vtkCubeSource",
+    "vtkCylinderSource",
     "vtkFeatureEdges",
     "vtkFloatArray",
     "vtkGlyph3D",

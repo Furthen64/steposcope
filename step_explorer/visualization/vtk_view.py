@@ -104,6 +104,8 @@ class VtkView(QWidget):
     DEFAULT_CONTROL_NET_DENSITY = 100
     DEFAULT_NORMAL_ARROW_LIMIT = 48
     MAX_NORMAL_ARROW_LIMIT = 200
+    NORMAL_BASE_RING_RATIO = 0.3
+    NORMAL_BASE_RING_THICKNESS = 0.3
     LABEL_SPACING = 42.0
     LABEL_GRID_SIZE = 48.0
 
@@ -121,7 +123,7 @@ class VtkView(QWidget):
         xy_grid_color: str = "#4d5966",
         xy_grid_scale: float = 1.0,
         show_mesh_edges: bool = False,
-        mesh_edge_opacity: float = 0.6,
+        mesh_edge_opacity: float = 0.3,
         background_color: str = "#46596d",
     ):
         super().__init__(parent)
@@ -185,6 +187,7 @@ class VtkView(QWidget):
         self._analysis_show_normals = False
         self._analysis_normal_scale = 1.0
         self._analysis_normal_glyph = None
+        self._analysis_normal_base_glyph = None
         self._orbit_button = Qt.MouseButton.NoButton
         self._navigation_action = None
         self._last_orbit_pos = None
@@ -880,6 +883,10 @@ class VtkView(QWidget):
         if (not style_changed and self._analysis_normal_glyph is not None
                 and self.renderer is not None and self._initialized):
             self._analysis_normal_glyph.SetScaleFactor(self._normal_length * new_normal_scale)
+            if self._analysis_normal_base_glyph is not None:
+                self._analysis_normal_base_glyph.SetScaleFactor(
+                    self._normal_length * new_normal_scale * self.NORMAL_BASE_RING_RATIO,
+                )
             self._profiled_render()
             return
         if self.renderer is not None and self._initialized and self._last_snapshot is not None:
@@ -1352,6 +1359,7 @@ class VtkView(QWidget):
         self._actors_by_entity.clear()
         self._face_actors.clear()
         self._analysis_normal_glyph = None
+        self._analysis_normal_base_glyph = None
         self._rendered_items = self._snapshot_render_items(snapshot)
         self._rendered_selected_id = selected_id
         self._mesh_edge_actors.clear()
@@ -2465,7 +2473,13 @@ class VtkView(QWidget):
             magnitude = sum(component * component for component in cross) ** 0.5
             if magnitude <= 1e-12:
                 continue
-            positions.InsertNextPoint(*((getattr(p, axis) + getattr(q, axis) + getattr(r, axis)) / 3 for axis in ("x", "y", "z")))
+            # Planar previews fan-triangulate from one corner, so the first
+            # triangle's centroid hugs an edge; anchor its arrow to the face
+            # center instead while keeping the sampled winding direction.
+            position = self._center(mesh.points) if not mesh.curved else (
+                (p.x + q.x + r.x) / 3, (p.y + q.y + r.y) / 3, (p.z + q.z + r.z) / 3
+            )
+            positions.InsertNextPoint(*position)
             directions.InsertNextTuple3(*(component / magnitude for component in cross))
         if not positions.GetNumberOfPoints():
             return
@@ -2496,6 +2510,39 @@ class VtkView(QWidget):
         actor.SetPickable(False)
         self.renderer.AddActor(actor)
         self._register_actor(actor)
+        # A thin ring lying in the face plane marks where each arrow starts,
+        # making its out-of-plane direction easier to read at a glance.
+        ring = vtk.vtkCylinderSource()
+        ring.SetRadius(1.0)
+        ring.SetHeight(self.NORMAL_BASE_RING_THICKNESS)
+        ring.SetResolution(24)
+        ring.SetCapping(False)
+        base_glyph = vtk.vtkGlyph3D()
+        base_glyph.SetInputData(data)
+        base_glyph.SetSourceConnection(ring.GetOutputPort())
+        base_glyph.SetVectorModeToUseNormal()
+        base_glyph.SetScaleModeToScaleByVector()
+        base_glyph.SetScaleFactor(
+            getattr(self, "_normal_length", 1.0) * length_scale * self.NORMAL_BASE_RING_RATIO,
+        )
+        if highlighted:
+            self._analysis_normal_base_glyph = base_glyph
+        base_glyph.OrientOn()
+        base_mapper = vtk.vtkPolyDataMapper()
+        base_mapper.SetInputConnection(base_glyph.GetOutputPort())
+        base_actor = vtk.vtkActor()
+        base_actor.SetMapper(base_mapper)
+        base_actor.GetProperty().SetColor(
+            (0.48, 0.50, 0.53) if dimmed else
+            ((1.0, 0.93, 0.35) if highlighted else (1.0, 0.9, 0.2))
+        )
+        base_actor.GetProperty().SetOpacity(
+            self._analysis_context_opacity if dimmed else (0.85 if highlighted else 0.6),
+        )
+        base_actor.GetProperty().LightingOff()
+        base_actor.SetPickable(False)
+        self.renderer.AddActor(base_actor)
+        self._register_actor(base_actor)
 
     @timed("viewport.render")
     def _profiled_render(self):
