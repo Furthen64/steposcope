@@ -1703,6 +1703,10 @@ class GeometryBuilder:
                     rational, loops, loop_segments, protected_points,
                 )
                 if patch is None:
+                    patch = self._rational_projected_boundary_mesh(
+                        rational, loops, loop_segments,
+                    )
+                if patch is None:
                     return None
                 points, triangles = patch
                 sense = next((arg for arg in reversed(entity.arguments) if isinstance(arg, StepEnumeration)), None)
@@ -1745,6 +1749,8 @@ class GeometryBuilder:
                 )
         if surface and surface.type_name.upper() == "CYLINDRICAL_SURFACE" and len(loops) == 2:
             stitched = self._stitch_closed_loops(loops[0], loops[1])
+            if stitched is None:
+                stitched = self._stitch_unequal_closed_loops(loops[0], loops[1])
             if stitched:
                 points, triangles = stitched
                 return Mesh(
@@ -1855,6 +1861,129 @@ class GeometryBuilder:
                 **self._face_metadata(entity, surface),
             )
         return None
+
+    def _rational_projected_boundary_mesh(
+        self,
+        surface: _RationalSplineSurface,
+        loops: list[list[Point3]],
+        loop_segments: list[list[tuple[Point3, ...]]],
+    ) -> tuple[tuple[Point3, ...], tuple[tuple[int, int, int], ...]] | None:
+        """Preview a rational patch with curved, non-iso-parametric trim rails.
+
+        Rational STEP faces are often bounded by independently fitted curves
+        (circles and short spline arcs), rather than the four iso-parametric
+        rails handled by ``_rational_trim_mesh``. Project the sampled trim to
+        the surface parameter domain, triangulate that contour, and refine the
+        interior on the actual surface while preserving the original 3-D trim.
+        The tolerance allows the small fit error between the trim curves and
+        their supporting NURBS patch without accepting unrelated geometry.
+        """
+        if len(loops) != 1 or len(loop_segments) != 1 or len(loops[0]) < 3:
+            return None
+        boundary = loops[0]
+        scale = max(
+            (self._distance(boundary[0], point) for point in boundary),
+            default=0.0,
+        )
+        if scale <= 0:
+            return None
+        tolerance = max(scale * 0.05, 1e-5)
+        uv_boundary = []
+        previous = None
+        for point in boundary:
+            error, u, v = surface.project(point, previous)
+            if not math.isfinite(error) or math.sqrt(error) > tolerance:
+                return None
+            uv_boundary.append(Point3(u, v, 0.0))
+            previous = (u, v)
+
+        triangulated = self._ear_clip_loop(uv_boundary)
+        if triangulated is None:
+            return None
+        uv_points, triangles = triangulated
+        if len(uv_points) != len(boundary):
+            return None
+        triangles = self._consistent_uv_winding(uv_points, triangles)
+        if not triangles:
+            return None
+        points, triangles = self._refine_curved_trim_mesh(
+            tuple(boundary), uv_points, triangles, [len(boundary)],
+            lambda parameter: surface.evaluate(parameter.x, parameter.y),
+            max(scale * 0.08, 1e-6),
+        )
+        return (points, triangles) if triangles else None
+
+    def _stitch_unequal_closed_loops(
+        self, first: list[Point3], second: list[Point3]
+    ) -> tuple[tuple[Point3, ...], tuple[tuple[int, int, int], ...]] | None:
+        """Join two closed boundary rails with different sample counts."""
+        if min(len(first), len(second)) < 3:
+            return None
+
+        def closed(points):
+            return points if points[0] == points[-1] else [*points, points[0]]
+
+        first = closed(first)
+        second = closed(second)
+
+        def fractions(points):
+            lengths = [self._distance(a, b) for a, b in zip(points, points[1:])]
+            total = sum(lengths)
+            if total <= 1e-12:
+                return None
+            result = [0.0]
+            for length in lengths:
+                result.append(result[-1] + length / total)
+            result[-1] = 1.0
+            return result
+
+        first_t, second_t = fractions(first), fractions(second)
+        if first_t is None or second_t is None:
+            return None
+        # Align the cyclic seam and direction before walking both rails in
+        # normalized arc-length order. This preserves every input boundary
+        # segment while allowing unlike STEP sampling densities.
+        choices = []
+        ring = second[:-1]
+        for source in (ring, list(reversed(ring))):
+            for shift in range(len(source)):
+                rotated = source[shift:] + source[:shift]
+                aligned = [*rotated, rotated[0]]
+                score = sum(
+                    self._distance(
+                        a,
+                        aligned[round(i * (len(aligned) - 1) / (len(first) - 1))],
+                    ) ** 2
+                    for i, a in enumerate(first)
+                )
+                choices.append((score, aligned))
+        aligned = min(choices, key=lambda item: item[0])[1]
+        second_t = fractions(aligned)
+        if second_t is None:
+            return None
+
+        a_count = len(first) - 1
+        b_count = len(aligned) - 1
+        points = tuple(first[:-1] + aligned[:-1])
+        triangles = []
+        i = j = 0
+        while i < a_count or j < b_count:
+            next_a = first_t[i + 1] if i < a_count else math.inf
+            next_b = second_t[j + 1] if j < b_count else math.inf
+            a = i % a_count
+            b = a_count + (j % b_count)
+            if abs(next_a - next_b) <= 1e-9:
+                triangles.extend(((a, (i + 1) % a_count, a_count + ((j + 1) % b_count)),
+                                  (a, a_count + ((j + 1) % b_count), b)))
+                i += 1
+                j += 1
+            elif next_a < next_b:
+                triangles.append((a, (i + 1) % a_count, b))
+                i += 1
+            else:
+                triangles.append((a, a_count + ((j + 1) % b_count), b))
+                j += 1
+        return (points, tuple(triangles)) if triangles else None
 
     def _rational_spline_surface(self, surface: StepEntity) -> _RationalSplineSurface | None:
         if len(surface.arguments) != 1 or not isinstance(surface.arguments[0], StepComplexValue):
@@ -3309,7 +3438,7 @@ class GeometryBuilder:
         # STEP exporters may encode a trim curve as a B-spline approximation
         # to an analytic cylinder.  Accept its small scale-relative residual
         # while keeping the shared boundary samples identical across faces.
-        tolerance = max(abs(radius) * 2e-4, 1e-6)
+        tolerance = max(abs(radius) * 5e-4, 1e-6)
         uv_loops: list[list[Point3]] = []
         for loop in loops:
             if len(loop) < 3:
@@ -4001,7 +4130,11 @@ class GeometryBuilder:
         if scale <= 1e-12:
             return False
         coordinate_scale = max(abs(value) for point in coordinates for value in point)
-        tolerance = max(scale * 1e-7, coordinate_scale * 1e-12, 1e-9)
+        # STEP trim curves are commonly fitted independently from their
+        # analytic support and can sit a few thousandths off a plane. Keep the
+        # preview on the declared plane while accepting that small source
+        # residual instead of dropping the entire face.
+        tolerance = max(scale * 5e-4, coordinate_scale * 1e-12, 1e-9)
 
         origin = None
         normal = None
