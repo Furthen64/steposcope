@@ -9,6 +9,30 @@ from step_explorer.step.parser import parse_step
 from step_explorer.step.values import StepAggregate, StepNumber, StepReference
 
 
+def test_closed_loft_with_independently_sampled_rails_is_meshed():
+    source = Path(__file__).resolve().parents[1] / "corpus/complex_bspline/circlesloft1.STEP"
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    faces = {face.entity_id: face for face in snapshot.faces}
+
+    assert set(faces) == {34, 55, 88, 355}
+    for face_id in (34, 355):
+        face = faces[face_id]
+        assert face.curved and len(face.triangles) > 200
+        # The loft must contain evaluated interior, not just its end caps.
+        assert any(20 < point.x < 140 for point in face.points)
+        assert all(len(set(triangle)) == 3 for triangle in face.triangles)
+        assert max(builder._distance(face.points[a], face.points[b])
+                   for triangle in face.triangles
+                   for a, b in zip(triangle, (triangle[1], triangle[2], triangle[0]))) < 10
+        reasons = builder.assess_face(face_id, face).reasons
+        assert not any("sliver" in reason or "zero-area" in reason for reason in reasons)
+
+    report = assess_completeness(document, snapshot)
+    assert report.meshed_face_count == 4
+
+
 def test_same_direction_pairs_expose_edge_and_both_face_uses():
     source = Path(__file__).resolve().parents[1] / "tests/corpus/BROKEN_examples/same_direction_pairs/holefillets2_issue_2samedirpairs.step"
     document = parse_step(source.read_text(encoding="utf-8"))

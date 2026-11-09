@@ -2740,7 +2740,15 @@ class GeometryBuilder:
                     if best is None or score < best[0]:
                         best = score, current_u_values, v_values, rails
         if best is None:
-            return None
+            # Independently fitted rails need not have the same sample counts
+            # as the surface knots. Map each rail onto a candidate half-domain,
+            # then build a shared grid instead of triangulating a boundary fan.
+            best = self._sampled_closed_loft_grid(
+                segments, evaluate, u_start, u_middle, u_end, v_start, v_end,
+                samples, u_knots, v_knots, scale,
+            )
+            if best is None:
+                return None
         _, u_values, v_values, rails = best
         bottom, top, left, right = rails
         width = len(u_values)
@@ -2779,6 +2787,91 @@ class GeometryBuilder:
             lambda parameter: evaluate(parameter.x, parameter.y),
             max(scale * 0.07, 1e-6), boundary_edges=perimeter,
         )
+
+    def _sampled_closed_loft_grid(
+        self, segments, evaluate, u_start, u_middle, u_end, v_start, v_end,
+        samples, u_knots, v_knots, scale,
+    ):
+        """Match four sampled iso-parametric rails and form a regular UV grid."""
+        tolerance = max(scale * 3e-4, 1e-5)
+        for low, high in ((u_start, u_middle), (u_middle, u_end)):
+            curves = (
+                lambda t: evaluate(low + (high - low) * t, v_start),
+                lambda t: evaluate(low + (high - low) * t, v_end),
+                lambda t: evaluate(low, v_start + (v_end - v_start) * t),
+                lambda t: evaluate(high, v_start + (v_end - v_start) * t),
+            )
+            ends = [(curve(0), curve(1)) for curve in curves]
+            matches = []
+            for order in permutations(range(4)):
+                oriented = []
+                error = 0.0
+                for index, (start, end) in zip(order, ends):
+                    segment = segments[index]
+                    forward = self._distance(segment[0], start) + self._distance(segment[-1], end)
+                    reverse = self._distance(segment[-1], start) + self._distance(segment[0], end)
+                    error += min(forward, reverse)
+                    oriented.append(segment if forward <= reverse else tuple(reversed(segment)))
+                matches.append((error, oriented))
+            error, rails = min(matches, key=lambda item: item[0])
+            if error > tolerance * 8:
+                continue
+            rail_parameters = []
+            for rail, curve in zip(rails, curves):
+                # A dense lookup brackets a one-dimensional closest point;
+                # golden-section refinement then gives stable rail parameters.
+                count = 256
+                lookup = [curve(i / count) for i in range(count + 1)]
+                values = [0.0]
+                for point in rail[1:-1]:
+                    index = min(range(count + 1), key=lambda i: self._distance(point, lookup[i]))
+                    a, b = max(0, index - 1) / count, min(count, index + 1) / count
+                    for _ in range(24):
+                        x = a + (b - a) * 0.38196601125
+                        y = a + (b - a) * 0.61803398875
+                        if self._distance(point, curve(x)) < self._distance(point, curve(y)):
+                            b = y
+                        else:
+                            a = x
+                    value = (a + b) / 2
+                    if value <= values[-1] or self._distance(point, curve(value)) > tolerance:
+                        break
+                    values.append(value)
+                else:
+                    values.append(1.0)
+                    if values[-2] < 1.0:
+                        rail_parameters.append(values)
+                        continue
+                break
+            if len(rail_parameters) != 4:
+                continue
+
+            def interpolate(rail, parameters, value):
+                index = min(bisect_right(parameters, value) - 1, len(parameters) - 2)
+                index = max(index, 0)
+                fraction = (value - parameters[index]) / (parameters[index + 1] - parameters[index])
+                a, b = rail[index], rail[index + 1]
+                return Point3(*(getattr(a, axis) + fraction * (getattr(b, axis) - getattr(a, axis))
+                                for axis in ('x', 'y', 'z')))
+
+            def grid(start, end, count, knot_values):
+                # Avoid nearly coincident columns from independently fitted
+                # curves and knots; they create zero-area and sliver triangles.
+                step = (end - start) / count
+                values = [start + step * i for i in range(count + 1)]
+                for value in knot_values:
+                    if start < value < end and min(abs(value - other) for other in values) > step * 0.25:
+                        values.append(value)
+                return sorted(values)
+
+            u_values = grid(low, high, 64, samples(u_knots, low, high))
+            v_values = grid(v_start, v_end, 32, samples(v_knots, v_start, v_end))
+            aligned = [tuple(interpolate(rails[i], rail_parameters[i], (value - low) / (high - low))
+                             for value in u_values) for i in (0, 1)]
+            aligned += [tuple(interpolate(rails[i], rail_parameters[i], (value - v_start) / (v_end - v_start))
+                              for value in v_values) for i in (2, 3)]
+            return 0.0, u_values, v_values, aligned
+        return None
 
     def _trimmed_spline_surface_mesh(
         self, surface: StepEntity, loop_segments: list[list[tuple[Point3, ...]]]
