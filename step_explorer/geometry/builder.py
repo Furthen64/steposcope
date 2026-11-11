@@ -790,13 +790,13 @@ class GeometryBuilder:
             if sampled:
                 return sampled
         if len(points) == 2 and curve and curve.type_name.upper() == "B_SPLINE_CURVE_WITH_KNOTS":
-            sampled = self._bspline_curve_points(curve)
+            same_sense = next(
+                (item for item in reversed(entity.arguments) if isinstance(item, StepEnumeration)), None
+            )
+            sampled = self._bspline_curve_points(
+                curve, points[0], points[1], same_sense is None or same_sense.value.upper() == "T",
+            )
             if sampled:
-                same_sense = next(
-                    (item for item in reversed(entity.arguments) if isinstance(item, StepEnumeration)), None
-                )
-                if same_sense and same_sense.value.upper() == "F":
-                    sampled = tuple(reversed(sampled))
                 sampled = tuple(sampled)
                 sampled = (points[0], *sampled[1:-1], points[1])
                 return sampled
@@ -951,7 +951,10 @@ class GeometryBuilder:
             result.extend(span if not result else span[1:])
         return tuple(result)
 
-    def _bspline_curve_points(self, curve: StepEntity) -> tuple[Point3, ...]:
+    def _bspline_curve_points(
+        self, curve: StepEntity, start_point: Point3 | None = None,
+        end_point: Point3 | None = None, same_sense: bool = True,
+    ) -> tuple[Point3, ...]:
         """Sample a non-rational B-spline curve over each non-empty knot span."""
 
         if len(curve.arguments) < 8:
@@ -1023,13 +1026,42 @@ class GeometryBuilder:
             for axis in ("x", "y", "z")
         )
         tolerance = max(scale * 5e-4, 1e-8)
+        if start_point is not None and end_point is not None:
+            start_full, end_full = ((first_parameter, last_parameter) if same_sense
+                                    else (last_parameter, first_parameter))
+            if (self._distance(start_point, evaluate(start_full)) > tolerance
+                    or self._distance(end_point, evaluate(end_full)) > tolerance):
+                def project(point):
+                    samples = [left + (right - left) * i / 16
+                               for left, right in zip(knot_breaks, knot_breaks[1:])
+                               for i in range(16)] + [last_parameter]
+                    closest = min(range(len(samples)), key=lambda i: self._distance(point, evaluate(samples[i])))
+                    lo = samples[max(0, closest - 1)]
+                    hi = samples[min(len(samples) - 1, closest + 1)]
+                    for _ in range(40):
+                        a = lo + (hi - lo) * 0.3819660112501051
+                        b = hi - (hi - lo) * 0.3819660112501051
+                        if self._distance(point, evaluate(a)) < self._distance(point, evaluate(b)):
+                            hi = b
+                        else:
+                            lo = a
+                    candidates = (samples[closest], (lo + hi) / 2)
+                    parameter = min(candidates, key=lambda value: self._distance(point, evaluate(value)))
+                    return parameter if self._distance(point, evaluate(parameter)) <= tolerance else None
+                start_full, end_full = project(start_point), project(end_point)
+                if (start_full is None or end_full is None
+                        or (same_sense and start_full >= end_full)
+                        or (not same_sense and start_full <= end_full)):
+                    return ()
+            low, high = sorted((start_full, end_full))
+            knot_breaks = [low] + [value for value in knot_breaks if low < value < high] + [high]
         result = []
         for start, end in zip(knot_breaks, knot_breaks[1:]):
             span = self._adaptive_curve_points(evaluate, start, end, tolerance)
             if not span:
                 return ()
             result.extend(span if not result else span[1:])
-        return tuple(result)
+        return tuple(result if same_sense else reversed(result))
 
     def _circle_arc(
         self, circle: StepEntity, start: Point3, end: Point3, same_sense: bool
@@ -1048,12 +1080,14 @@ class GeometryBuilder:
         if center is None or normal is None:
             return ()
         normal = self._normalized(normal)
+        if normal is None:
+            return ()
         if x_axis is None:
             seed = (1.0, 0.0, 0.0) if abs(normal[0]) < 0.9 else (0.0, 1.0, 0.0)
             x_axis = self._normalized(self._cross(seed, normal))
         else:
-            x_axis = self._normalized(x_axis)
-        y_axis = self._normalized(self._cross(normal, x_axis))
+            x_axis = self._normalized(tuple(x_axis[i] - self._dot(x_axis, normal) * normal[i] for i in range(3)))
+        y_axis = self._normalized(self._cross(normal, x_axis)) if x_axis else None
         if not normal or not x_axis or not y_axis:
             return ()
 
@@ -1108,11 +1142,13 @@ class GeometryBuilder:
         if center is None or normal is None:
             return ()
         normal = self._normalized(normal)
+        if normal is None:
+            return ()
         if x_axis is None:
             seed = (1.0, 0.0, 0.0) if abs(normal[0]) < 0.9 else (0.0, 1.0, 0.0)
             x_axis = self._normalized(self._cross(seed, normal))
         else:
-            x_axis = self._normalized(x_axis)
+            x_axis = self._normalized(tuple(x_axis[i] - self._dot(x_axis, normal) * normal[i] for i in range(3)))
         y_axis = self._normalized(self._cross(normal, x_axis)) if normal and x_axis else None
         if not normal or not x_axis or not y_axis:
             return ()
@@ -1738,7 +1774,7 @@ class GeometryBuilder:
                              for arg in surface.arguments[5:7])
                 if evaluator is not None and not closed and not any(evaluator.periodic):
                     candidate = self._rational_projected_boundary_mesh(
-                        evaluator, loops, loop_segments, relative_tolerance=3e-4, quality_mesh=True,
+                        evaluator, loops, loop_segments, relative_tolerance=5e-4, quality_mesh=True,
                     )
                     if candidate is not None:
                         candidate_preview = Mesh(entity.entity_id, candidate[0], candidate[1], curved=True)
@@ -1922,7 +1958,8 @@ class GeometryBuilder:
 
         if quality_mesh:
             mesh = self._spline_delaunay_mesh(surface, boundary, uv_boundary)
-            return mesh
+            if mesh is not None:
+                return mesh
         triangulated = self._ear_clip_loop(uv_boundary)
         if triangulated is None:
             return None

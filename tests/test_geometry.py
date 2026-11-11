@@ -11,6 +11,25 @@ from step_explorer.step.parser import parse_step
 from step_explorer.step.values import StepAggregate, StepNumber, StepReference
 
 
+def test_helgear_trimmed_spline_edges_and_tilted_circle_axes_are_meshed():
+    source = Path(__file__).resolve().parents[1] / "corpus/TOUGH_stresstests/helgear2_44kb.step"
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    report = assess_completeness(document, snapshot)
+    assert report.face_count == report.meshed_face_count == 18
+    solid = build_report(source, document, snapshot.faces)["solids"][0]
+    assert solid["verdict"] == "consistent"
+    assert solid["n_boundary_edges"] == 0
+    edge = next(item for item in snapshot.polylines if item.entity_id == 26)
+    assert len(edge.points) > 2
+    assert min(point.z for point in edge.points) >= 94.0
+    assert max(point.z for point in edge.points) <= 100.001
+    for edge_id in (56, 92, 98):
+        edge = next(item for item in snapshot.polylines if item.entity_id == edge_id)
+        assert all(abs(point.y) < 0.001 for point in edge.points)
+
+
 @pytest.mark.parametrize(("filename", "face_id"), [
     ("box_2holecuts_rounded_top.step", 492),
     ("box_3cuts_rounded_top.step", 477),
