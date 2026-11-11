@@ -21,6 +21,9 @@ def test_helgear_trimmed_spline_edges_and_tilted_circle_axes_are_meshed():
     solid = build_report(source, document, snapshot.faces)["solids"][0]
     assert solid["verdict"] == "consistent"
     assert solid["n_boundary_edges"] == 0
+    for face_id in (44, 359, 378, 501, 519):
+        face = next(face for face in snapshot.faces if face.entity_id == face_id)
+        assert not any("sliver triangles" in reason for reason in builder.assess_face(face_id, face).reasons)
     edge = next(item for item in snapshot.polylines if item.entity_id == 26)
     assert len(edge.points) > 2
     assert min(point.z for point in edge.points) >= 94.0
@@ -28,6 +31,28 @@ def test_helgear_trimmed_spline_edges_and_tilted_circle_axes_are_meshed():
     for edge_id in (56, 92, 98):
         edge = next(item for item in snapshot.polylines if item.entity_id == edge_id)
         assert all(abs(point.y) < 0.001 for point in edge.points)
+    edge = next(item for item in snapshot.polylines if item.entity_id == 354)
+    assert len(edge.points) > 4
+    assert edge.points[0].z > 99 and edge.points[-1].z == pytest.approx(0)
+    for face_id, surface_id in ((378, 370), (519, 512)):
+        face = next(face for face in snapshot.faces if face.entity_id == face_id)
+        surface = builder._nonrational_spline_surface(document.entity(surface_id))
+        uv = [surface.project(point)[1:] for point in face.points]
+        du = (surface.u_range[1] - surface.u_range[0]) * 1e-5
+        dv = (surface.v_range[1] - surface.v_range[0]) * 1e-5
+        def diff(a, b):
+            return (a.x - b.x, a.y - b.y, a.z - b.z)
+        for a, b, c in face.triangles:
+            u = sum(uv[i][0] for i in (a, b, c)) / 3
+            v = sum(uv[i][1] for i in (a, b, c)) / 3
+            normal = builder._cross(diff(face.points[b], face.points[a]), diff(face.points[c], face.points[a]))
+            tangent_u = diff(surface.evaluate(min(u + du, surface.u_range[1]), v),
+                             surface.evaluate(max(u - du, surface.u_range[0]), v))
+            tangent_v = diff(surface.evaluate(u, min(v + dv, surface.v_range[1])),
+                             surface.evaluate(u, max(v - dv, surface.v_range[0])))
+            expected = builder._cross(tangent_u, tangent_v)
+            length = math.sqrt(builder._dot(normal, normal) * builder._dot(expected, expected))
+            assert length > 0 and builder._dot(normal, expected) / length > 0.99
 
 
 @pytest.mark.parametrize(("filename", "face_id"), [

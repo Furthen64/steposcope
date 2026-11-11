@@ -1026,6 +1026,7 @@ class GeometryBuilder:
             for axis in ("x", "y", "z")
         )
         tolerance = max(scale * 5e-4, 1e-8)
+        forward = same_sense
         if start_point is not None and end_point is not None:
             start_full, end_full = ((first_parameter, last_parameter) if same_sense
                                     else (last_parameter, first_parameter))
@@ -1049,10 +1050,11 @@ class GeometryBuilder:
                     parameter = min(candidates, key=lambda value: self._distance(point, evaluate(value)))
                     return parameter if self._distance(point, evaluate(parameter)) <= tolerance else None
                 start_full, end_full = project(start_point), project(end_point)
-                if (start_full is None or end_full is None
-                        or (same_sense and start_full >= end_full)
-                        or (not same_sense and start_full <= end_full)):
+                if start_full is None or end_full is None or abs(start_full - end_full) <= 1e-12:
                     return ()
+                # For an open curve the vertices determine the unique trim
+                # direction, even when an exporter writes the opposite sense.
+                forward = start_full < end_full
             low, high = sorted((start_full, end_full))
             knot_breaks = [low] + [value for value in knot_breaks if low < value < high] + [high]
         result = []
@@ -1061,7 +1063,7 @@ class GeometryBuilder:
             if not span:
                 return ()
             result.extend(span if not result else span[1:])
-        return tuple(result if same_sense else reversed(result))
+        return tuple(result if forward else reversed(result))
 
     def _circle_arc(
         self, circle: StepEntity, start: Point3, end: Point3, same_sense: bool
@@ -1969,6 +1971,22 @@ class GeometryBuilder:
         triangles = self._consistent_uv_winding(uv_points, triangles)
         if not triangles:
             return None
+        if quality_mesh:
+            xmin, xmax = min(p.x for p in uv_points), max(p.x for p in uv_points)
+            ymin, ymax = min(p.y for p in uv_points), max(p.y for p in uv_points)
+            width = self._distance(surface.evaluate(xmin, (ymin + ymax) / 2),
+                                   surface.evaluate(xmax, (ymin + ymax) / 2))
+            height = self._distance(surface.evaluate((xmin + xmax) / 2, ymin),
+                                    surface.evaluate((xmin + xmax) / 2, ymax))
+            if min(width, height, xmax - xmin, ymax - ymin) > 1e-10:
+                sx, sy = width / (xmax - xmin), height / (ymax - ymin)
+                scaled = tuple(Point3((p.x - xmin) * sx, (p.y - ymin) * sy, 0) for p in uv_points)
+                improved = self._improve_trim_mesh(
+                    scaled, triangles, tuple(boundary), [scaled], 1.0,
+                    lambda p: surface.evaluate(p.x / sx + xmin, p.y / sy + ymin),
+                )
+                if improved is not None:
+                    return improved
         points, triangles = self._refine_curved_trim_mesh(
             tuple(boundary), uv_points, triangles, [len(boundary)],
             lambda parameter: surface.evaluate(parameter.x, parameter.y),
@@ -3785,7 +3803,7 @@ class GeometryBuilder:
         uv_points, triangles = triangulated
         triangles = self._consistent_uv_winding(uv_points, triangles)
         if len(uv_loops) > 1:
-            improved = self._improve_cylindrical_trim(uv_points, triangles, points, uv_loops, radius, surface_point)
+            improved = self._improve_trim_mesh(uv_points, triangles, points, uv_loops, radius, surface_point)
             if improved is not None:
                 return improved
         # Keep the original STEP trim samples on shared edges.  They are
@@ -3797,7 +3815,7 @@ class GeometryBuilder:
         )
 
     @staticmethod
-    def _improve_cylindrical_trim(uv_points, triangles, boundary, loops, radius, surface_point):
+    def _improve_trim_mesh(uv_points, triangles, boundary, loops, radius, surface_point):
         """Add interior vertices and improve edges while retaining all trim segments."""
         xy = [(p.x * radius, p.y) for p in uv_points]
         xmin, xmax = min(p[0] for p in xy), max(p[0] for p in xy)
