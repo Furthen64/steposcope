@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from step_explorer.headless import _face_color, _face_label_position, build_report, process_file, render_png
+from step_explorer.headless import _add_face_labels, _face_color, _face_label_position, build_report, process_file, render_png
 from step_explorer.geometry.builder import GeometryBuilder, Mesh, Point3
 from step_explorer.main import _render_main
 from step_explorer.step.parser import parse_step
@@ -131,6 +131,38 @@ def test_faces_mode_renders_a_large_entity_id_and_skips_degenerate_labels(tmp_pa
     assert (tmp_path / "large.png").stat().st_size > 0
     assert _face_label_position(Mesh(large_id, mesh.points, ()), 0.1) is None
 
+
+
+def test_face_pointer_ends_at_projected_surface_anchor():
+    from step_explorer.vtk_lite import vtk
+
+    renderer = vtk.vtkRenderer()
+    window = vtk.vtkRenderWindow()
+    window.SetSize(400, 300)
+    window.AddRenderer(renderer)
+    anchor = (0.0, 0.0, 0.0)
+    renderer.SetWorldPoint(*anchor, 1.0)
+    renderer.WorldToDisplay()
+    projected = renderer.GetDisplayPoint()
+    _add_face_labels(vtk, renderer, [(42, anchor, (1.0, 0.0, 0.0))], 400, 300, 16)
+    actors = renderer.GetViewProps()
+    actors.InitTraversal()
+    pointer = actors.GetNextProp()
+    tip = pointer.GetMapper().GetInput().GetPoint(2)
+    assert tip[:2] == pytest.approx(projected[:2])
+    assert actors.GetNextProp().GetInput() == "#42"
+
+
+def test_headless_background_has_64_pixel_checks(tmp_path):
+    from PySide6.QtGui import QImage
+
+    output = tmp_path / "checks.png"
+    render_png([], {"solids": []}, output, 256, 256, "iso", "shaded")
+    image = QImage(str(output))
+    first = image.pixelColor(10, 10)
+    assert first == image.pixelColor(138, 10)
+    assert first == image.pixelColor(74, 74)
+    assert first != image.pixelColor(74, 10)
 
 def test_unbounded_sphere_face_builds_a_closed_consistent_mesh(tmp_path):
     source = """ISO-10303-21;DATA;

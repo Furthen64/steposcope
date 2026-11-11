@@ -2351,11 +2351,22 @@ class VtkView(QWidget):
         elif orientation_mode and not dimmed:
             actor.GetProperty().SetColor(*front_color)
             actor.GetProperty().SetOpacity(1.0)
-            actor.GetProperty().LightingOff()
             back = vtk.vtkProperty()
             back.SetColor(*back_color)
             back.SetOpacity(1.0)
-            back.LightingOff()
+            for prop in (actor.GetProperty(), back):
+                prop.LightingOn()
+                prop.SetAmbient(0.55)
+                prop.SetDiffuse(0.45)
+                prop.SetSpecular(0.0)
+            if mesh.curved:
+                normals = vtk.vtkPolyDataNormals()
+                normals.SetInputData(data)
+                normals.SplittingOff()
+                normals.ConsistencyOff()
+                mapper.SetInputConnection(normals.GetOutputPort())
+                actor.GetProperty().SetInterpolationToPhong()
+                back.SetInterpolationToPhong()
             actor.SetBackfaceProperty(back)
         elif mesh.curved:
             # Shared vertices plus Phong interpolation make sampled analytic

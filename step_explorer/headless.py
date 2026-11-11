@@ -109,15 +109,13 @@ def _face_label_position(mesh: Mesh, offset: float) -> tuple[float, float, float
     if total_area == 0.0:
         return None
     centroid = tuple(value / total_area for value in weighted_centroid)
-    if mesh.curved:
-        # A curved face's mathematical centroid may lie inside the solid (the
-        # center of a cylinder, for example). Anchor to the tessellated point
-        # nearest that centroid so the label starts on the actual surface.
-        centroid, local_normal = min(
-            samples,
-            key=lambda sample: sum((sample[0][axis] - centroid[axis]) ** 2 for axis in range(3)),
-        )
-        summed_normal = list(local_normal)
+    # The centroid can lie outside a concave face or inside a curved solid.
+    # A triangle centroid is guaranteed to lie on the tessellated face.
+    centroid, local_normal = min(
+        samples,
+        key=lambda sample: sum((sample[0][axis] - centroid[axis]) ** 2 for axis in range(3)),
+    )
+    summed_normal = list(local_normal)
     normal_length = math.sqrt(sum(value * value for value in summed_normal))
     if normal_length <= total_area * 1e-12:
         summed_normal = list(fallback_normal)
@@ -174,7 +172,7 @@ class _LabelPlacer:
 def _label_position(anchor, label_width, label_height, occupied, width, height):
     """Place a label near its projected anchor without covering another id."""
 
-    centered = (anchor[0] - label_width / 2, anchor[1] - label_height / 2)
+    centered = (anchor[0] - label_width / 2, anchor[1] + 18.0)
     candidates = [centered]
     gap = 4.0
     for radius in range(1, 8):
@@ -197,51 +195,62 @@ def _add_face_labels(vtk, renderer, specs, width: int, height: int, font_size: i
     """Add stable, collision-aware face labels after the camera is framed."""
 
     occupied = _LabelPlacer(cell=max(48.0, font_size * 12.0))
+    labels = []
     for entity_id, anchor, color in sorted(specs):
         renderer.SetWorldPoint(*anchor, 1.0)
         renderer.WorldToDisplay()
         display_anchor = renderer.GetDisplayPoint()
         label_width = max(24.0, font_size * (0.65 * len(f"#{entity_id}") + 0.5))
         label_height = font_size * 1.35
-        position, box, displaced = _label_position(
+        position, box, _ = _label_position(
             display_anchor, label_width, label_height, occupied, width, height
         )
         occupied.add(box)
-        renderer.SetDisplayPoint(position[0], position[1], display_anchor[2])
-        renderer.DisplayToWorld()
-        world = renderer.GetWorldPoint()
-        divisor = world[3] or 1.0
-        label_position = tuple(component / divisor for component in world[:3])
 
-        label = vtk.vtkBillboardTextActor3D()
+        # Connect the closest edge of the label to the actual face point.
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        dx, dy = display_anchor[0] - cx, display_anchor[1] - cy
+        if abs(dx) / max(label_width, 1) > abs(dy) / max(label_height, 1):
+            x = box[2] if dx > 0 else box[0]
+            base = ((x, cy - label_height * 0.3), (x, cy + label_height * 0.3))
+        else:
+            y = box[3] if dy > 0 else box[1]
+            base = ((cx - label_width * 0.25, y), (cx + label_width * 0.25, y))
+        points = vtk.vtkPoints()
+        points.InsertNextPoint(*base[0], 0)
+        points.InsertNextPoint(*base[1], 0)
+        points.InsertNextPoint(display_anchor[0], display_anchor[1], 0)
+        triangle = vtk.vtkTriangle()
+        for i in range(3):
+            triangle.GetPointIds().SetId(i, i)
+        cells = vtk.vtkCellArray()
+        cells.InsertNextCell(triangle)
+        data = vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetPolys(cells)
+        mapper = vtk.vtkPolyDataMapper2D()
+        mapper.SetInputData(data)
+        pointer = vtk.vtkActor2D()
+        pointer.SetMapper(mapper)
+        pointer.GetProperty().SetColor(*color)
+        pointer.GetProperty().SetOpacity(0.85)
+        renderer.AddActor(pointer)
+
+        label = vtk.vtkTextActor()
         label.SetInput(f"#{entity_id}")
-        label.SetPosition(*label_position)
-        label.SetPickable(False)
-        label.SetUseBounds(False)
+        label.SetPosition(*position)
         text = label.GetTextProperty()
         text.SetColor(1.0, 1.0, 1.0)
         text.SetFontSize(font_size)
         text.SetBold(True)
         text.SetBackgroundColor(0.04, 0.05, 0.07)
-        text.SetBackgroundOpacity(0.72)
+        text.SetBackgroundOpacity(0.85)
         text.SetFrame(True)
         text.SetFrameColor(*color)
         text.SetFrameWidth(1)
+        labels.append(label)
+    for label in labels:
         renderer.AddActor(label)
-
-        if displaced:
-            line = vtk.vtkLineSource()
-            line.SetPoint1(*anchor)
-            line.SetPoint2(*label_position)
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputConnection(line.GetOutputPort())
-            leader = vtk.vtkActor()
-            leader.SetMapper(mapper)
-            leader.GetProperty().SetColor(*color)
-            leader.GetProperty().SetLineWidth(1.0)
-            leader.SetPickable(False)
-            leader.SetUseBounds(False)
-            renderer.AddActor(leader)
 
 
 def _face_ids(document: StepDocument, shell) -> list[int]:
@@ -437,11 +446,33 @@ camera: str,
 
     verdicts = {face["entity_id"]: face["ok"] for solid in report["solids"] for face in solid["faces"]}
     renderer = vtk.vtkRenderer()
-    renderer.SetBackground(0.10, 0.12, 0.15)
     window = vtk.vtkRenderWindow()
     window.SetOffScreenRendering(1)
     window.SetSize(width, height)
     window.SetMultiSamples(0)
+    # Render the checkerboard in a separate layer so it never affects framing.
+    import numpy as np
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+
+    yy, xx = np.indices((height, width))
+    shades = np.where((xx // 64 + yy // 64) % 2, 92, 122).astype(np.uint8)
+    pixels = np.repeat(shades[:, :, None], 3, axis=2)
+    image = vtk.vtkImageData()
+    image.SetDimensions(width, height, 1)
+    image.GetPointData().SetScalars(numpy_to_vtk(pixels.reshape(-1, 3), deep=True))
+    background_actor = vtk.vtkImageActor()
+    background_actor.SetInputData(image)
+    background = vtk.vtkRenderer()
+    background.AddActor(background_actor)
+    background_camera = background.GetActiveCamera()
+    background_camera.ParallelProjectionOn()
+    background_camera.SetFocalPoint((width - 1) / 2, (height - 1) / 2, 0)
+    background_camera.SetPosition((width - 1) / 2, (height - 1) / 2, 1)
+    background_camera.SetParallelScale(height / 2)
+    background.ResetCameraClippingRange()
+    window.SetNumberOfLayers(3)
+    window.AddRenderer(background)
+    renderer.SetLayer(1)
     window.AddRenderer(renderer)
     if fit_box is not None:
         # A visible actor is required: ResetCamera ignores invisible geometry, so
@@ -457,13 +488,7 @@ camera: str,
         outline_actor.GetProperty().SetOpacity(0.55)
         renderer.AddActor(outline_actor)
     label_font_size = max(12, min(28, round(min(width, height) / 45)))
-    # A billboard lies in the camera plane, not the face plane. It therefore
-    # needs more than a numerical epsilon of clearance or an oblique surface
-    # will slice through its glyphs even though the anchor itself is visible.
-    # Small images devote a larger share of the viewport to the minimum-size
-    # font, so their labels need proportionally more clearance.
-    offset_factor = max(0.05, 2 * label_font_size / max(min(width, height), 1))
-    label_offset = max(_scene_extent(meshes) * offset_factor, 1e-9)
+    label_offset = 0.0
     label_specs = []
     label_areas = []
     for mesh in meshes:
@@ -541,9 +566,8 @@ camera: str,
 
     # A small orientation triad provides a stable XYZ reference without
     # changing the model's camera framing.
-    window.SetNumberOfLayers(2)
     axes_renderer = vtk.vtkRenderer()
-    axes_renderer.SetLayer(1)
+    axes_renderer.SetLayer(2)
     axes_renderer.SetViewport(0.025, 0.025, 0.16, 0.16)
     axes_renderer.SetBackgroundAlpha(0.0)
     axes_renderer.SetInteractive(0)

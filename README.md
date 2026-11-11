@@ -158,6 +158,8 @@ while passing additional render options through:
 
 `render_step_file.sh` uses the same renderer to write isometric, front, top,
 and right views as separate PNGs. Pass `--views` to choose a different set.
+Headless renders use a 64-pixel checkerboard background. In `faces` mode,
+colored triangular pointers connect the face IDs to points on their faces.
 
 `headless/gensnapshots.sh` creates a time-lapse of a STEP file's geometry
 building up. Its defaults come from [`headless/snapshots.json`](headless/snapshots.json);

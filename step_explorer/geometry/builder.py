@@ -1725,6 +1725,26 @@ class GeometryBuilder:
                 )
         if surface and surface.type_name.upper() == "B_SPLINE_SURFACE_WITH_KNOTS":
             loft = self._loft_spline_mesh(surface, loop_segments)
+            # A rectangular trim can still produce a very poor boundary-fan
+            # mesh. Try the general constrained mesh when that happens.
+            sliver_preview = False
+            if loft is not None:
+                preview = Mesh(entity.entity_id, loft[0], loft[1], curved=True)
+                sliver_preview = any("sliver triangles" in reason
+                                     for reason in self.assess_face(entity.entity_id, preview).reasons)
+            if loft is None or sliver_preview:
+                evaluator = self._nonrational_spline_surface(surface)
+                closed = any(isinstance(arg, StepEnumeration) and arg.value.upper() == "T"
+                             for arg in surface.arguments[5:7])
+                if evaluator is not None and not closed and not any(evaluator.periodic):
+                    candidate = self._rational_projected_boundary_mesh(
+                        evaluator, loops, loop_segments, relative_tolerance=3e-4, quality_mesh=True,
+                    )
+                    if candidate is not None:
+                        candidate_preview = Mesh(entity.entity_id, candidate[0], candidate[1], curved=True)
+                        if loft is None or not any("sliver triangles" in reason for reason in
+                                                   self.assess_face(entity.entity_id, candidate_preview).reasons):
+                            loft = candidate
             if loft:
                 points, triangles = loft
                 sense = next((arg for arg in reversed(entity.arguments) if isinstance(arg, StepEnumeration)), None)
@@ -1867,6 +1887,9 @@ class GeometryBuilder:
         surface: _RationalSplineSurface,
         loops: list[list[Point3]],
         loop_segments: list[list[tuple[Point3, ...]]],
+        *,
+        relative_tolerance: float = 0.05,
+        quality_mesh: bool = False,
     ) -> tuple[tuple[Point3, ...], tuple[tuple[int, int, int], ...]] | None:
         """Preview a rational patch with curved, non-iso-parametric trim rails.
 
@@ -1887,7 +1910,7 @@ class GeometryBuilder:
         )
         if scale <= 0:
             return None
-        tolerance = max(scale * 0.05, 1e-5)
+        tolerance = max(scale * relative_tolerance, 1e-5)
         uv_boundary = []
         previous = None
         for point in boundary:
@@ -1897,6 +1920,9 @@ class GeometryBuilder:
             uv_boundary.append(Point3(u, v, 0.0))
             previous = (u, v)
 
+        if quality_mesh:
+            mesh = self._spline_delaunay_mesh(surface, boundary, uv_boundary)
+            return mesh
         triangulated = self._ear_clip_loop(uv_boundary)
         if triangulated is None:
             return None
@@ -1912,6 +1938,130 @@ class GeometryBuilder:
             max(scale * 0.08, 1e-6),
         )
         return (points, triangles) if triangles else None
+
+    def _spline_delaunay_mesh(self, surface, boundary, uv_boundary):
+        """Constrained UV triangulation with interior samples and intact trim edges."""
+        xmin, xmax = min(p.x for p in uv_boundary), max(p.x for p in uv_boundary)
+        ymin, ymax = min(p.y for p in uv_boundary), max(p.y for p in uv_boundary)
+        if xmax <= xmin or ymax <= ymin:
+            return None
+        # Scale each parameter direction by its physical length. This keeps
+        # the triangulation from treating a long, narrow face as a square.
+        u, v = (xmin + xmax) / 2, (ymin + ymax) / 2
+        width = self._distance(surface.evaluate(xmin, v), surface.evaluate(xmax, v))
+        height = self._distance(surface.evaluate(u, ymin), surface.evaluate(u, ymax))
+        if min(width, height) <= 1e-10:
+            return None
+        scale = max(width, height)
+        sx, sy = width / scale / (xmax - xmin), height / scale / (ymax - ymin)
+        coords = [((p.x - xmin) * sx, (p.y - ymin) * sy) for p in uv_boundary]
+        def inside(x, y):
+            result = False
+            for (ax, ay), (bx, by) in zip(coords, coords[1:] + coords[:1]):
+                if (ay > y) != (by > y) and x < (bx - ax) * (y - ay) / (by - ay) + ax:
+                    result = not result
+            return result
+        vtk_points = vtk.vtkPoints()
+        vtk_points.SetDataTypeToDouble()
+        uv_points = list(uv_boundary)
+        for x, y in coords:
+            vtk_points.InsertNextPoint(x, y, 0.0)
+        spacing = 1 / 24
+        nx, ny = max(1, math.ceil(width / scale / spacing)), max(1, math.ceil(height / scale / spacing))
+        for i in range(nx):
+            for j in range(ny):
+                x, y = (i + 0.5) * width / scale / nx, (j + 0.5) * height / scale / ny
+                if not inside(x, y):
+                    continue
+                # Nearly coincident points prevent VTK from recovering a trim edge.
+                if min((x - a) ** 2 + (y - b) ** 2 for a, b in coords) < (spacing * 0.12) ** 2:
+                    continue
+                vtk_points.InsertNextPoint(x, y, 0.0)
+                uv_points.append(Point3(x / sx + xmin, y / sy + ymin, 0.0))
+        data = vtk.vtkPolyData()
+        data.SetPoints(vtk_points)
+        edges = vtk.vtkCellArray()
+        edges.InsertNextCell(len(boundary) + 1)
+        for i in range(len(boundary)):
+            edges.InsertCellPoint(i)
+        edges.InsertCellPoint(0)
+        constraints = vtk.vtkPolyData()
+        constraints.SetPoints(vtk_points)
+        constraints.SetLines(edges)
+        delaunay = vtk.vtkDelaunay2D()
+        delaunay.SetInputData(data)
+        delaunay.SetSourceData(constraints)
+        delaunay.SetTolerance(0.0)
+        delaunay.Update()
+        output = delaunay.GetOutput()
+        triangles = []
+        incidence = {}
+        for i in range(output.GetNumberOfCells()):
+            cell = output.GetCell(i)
+            if cell.GetNumberOfPoints() != 3:
+                return None
+            tri = tuple(cell.GetPointId(j) for j in range(3))
+            triangles.append(tri)
+            for a, b in zip(tri, (tri[1], tri[2], tri[0])):
+                edge = tuple(sorted((a, b)))
+                incidence[edge] = incidence.get(edge, 0) + 1
+        expected = {tuple(sorted((i, (i + 1) % len(boundary)))) for i in range(len(boundary))}
+        if not triangles or {edge for edge, count in incidence.items() if count == 1} != expected:
+            return None
+        if any(count > 2 for count in incidence.values()):
+            return None
+        polygon_area = abs(sum(a[0] * b[1] - b[0] * a[1]
+                               for a, b in zip(coords, coords[1:] + coords[:1])))
+        mesh_coords = [((p.x - xmin) * sx, (p.y - ymin) * sy) for p in uv_points]
+        triangle_area = sum(abs((mesh_coords[b][0] - mesh_coords[a][0]) * (mesh_coords[c][1] - mesh_coords[a][1])
+                                - (mesh_coords[b][1] - mesh_coords[a][1]) * (mesh_coords[c][0] - mesh_coords[a][0]))
+                            for a, b, c in triangles)
+        if polygon_area <= 1e-14 or abs(triangle_area - polygon_area) > polygon_area * 1e-6:
+            return None
+        points = tuple(boundary) + tuple(surface.evaluate(p.x, p.y) for p in uv_points[len(boundary):])
+        if any(point is None for point in points):
+            return None
+        triangles = self._consistent_uv_winding(tuple(uv_points), tuple(triangles))
+        a, b, c = triangles[0]
+        if ((uv_points[b].x - uv_points[a].x) * (uv_points[c].y - uv_points[a].y)
+                - (uv_points[b].y - uv_points[a].y) * (uv_points[c].x - uv_points[a].x)) < 0:
+            triangles = tuple((a, c, b) for a, b, c in triangles)
+        return points, triangles
+
+    def _nonrational_spline_surface(self, surface: StepEntity) -> _RationalSplineSurface | None:
+        """Build the shared spline evaluator with unit weights for a STEP B-spline."""
+        args = surface.arguments
+        if len(args) < 13:
+            return None
+        degrees = [_number(args[i]) for i in (1, 2)]
+        if any(value is None or value < 1 or not value.is_integer() for value in degrees):
+            return None
+        degrees = tuple(int(value) for value in degrees)
+        rows = [_aggregate(row) for row in _aggregate(args[3])]
+        if (not rows or len(rows) <= degrees[0] or len(rows[0]) <= degrees[1]
+                or any(len(row) != len(rows[0]) for row in rows)):
+            return None
+        controls = tuple(tuple(self._cartesian(_ref(value) or -1) for value in row) for row in rows)
+        if any(point is None for row in controls for point in row):
+            return None
+        knots = []
+        for axis, count in enumerate((len(rows), len(rows[0]))):
+            multiplicities = [_number(value) for value in _aggregate(args[8 + axis])]
+            values = [_number(value) for value in _aggregate(args[10 + axis])]
+            if (not values or len(values) != len(multiplicities)
+                    or any(value is None or not value.is_integer() or value < 1 for value in multiplicities)
+                    or any(value is None or not math.isfinite(value) for value in values)):
+                return None
+            expanded = tuple(float(value) for multiplicity, value in zip(multiplicities, values)
+                             for _ in range(int(multiplicity)))
+            if (len(expanded) != count + degrees[axis] + 1
+                    or any(a > b for a, b in zip(expanded, expanded[1:]))
+                    or expanded[degrees[axis]] >= expanded[count]):
+                return None
+            knots.append(expanded)
+        return _RationalSplineSurface(
+            controls, tuple(tuple(1.0 for _ in row) for row in controls), degrees, tuple(knots),
+        )
 
     def _stitch_unequal_closed_loops(
         self, first: list[Point3], second: list[Point3]

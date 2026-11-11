@@ -99,6 +99,24 @@ def test_face_orientation_colors_front_and_back_without_transparency(view):
     assert actor.GetProperty().GetOpacity() == 1.0
     assert actor.GetProperty().GetColor() == pytest.approx((0.2, 0.5, 1.0))
     assert actor.GetBackfaceProperty().GetColor() == pytest.approx((1.0, 0.25, 0.2))
+    for prop in (actor.GetProperty(), actor.GetBackfaceProperty()):
+        assert prop.GetLighting()
+        assert prop.GetAmbient() == pytest.approx(0.55)
+        assert prop.GetDiffuse() == pytest.approx(0.45)
+
+
+@pytest.mark.skipif(vtk is None, reason="VTK is not installed")
+def test_normal_colors_use_smooth_normals_for_curved_faces(view):
+    view.normal_display = "Hidden"
+    view.face_color_mode = "normals"
+    mesh = Mesh(7, (Point3(0, 0, 0), Point3(1, 0, 0), Point3(0, 1, 0)),
+                ((0, 1, 2),), curved=True)
+
+    view._add_mesh(mesh, selected=False, labels=False, label_scale=1.0, label_text="")
+
+    actor = view._actors[0]
+    assert actor.GetMapper().GetInputConnection(0, 0).GetProducer().IsA("vtkPolyDataNormals")
+    assert actor.GetProperty().GetInterpolationAsString() == "Phong"
 
 
 @pytest.mark.skipif(vtk is None, reason="VTK is not installed")

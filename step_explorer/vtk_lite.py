@@ -22,6 +22,7 @@ from vtkmodules.vtkCommonDataModel import (
     vtkTriangle,
 )
 from vtkmodules.vtkFiltersCore import (
+    vtkDelaunay2D,
     vtkFeatureEdges,
     vtkGlyph3D,
     vtkPolyDataNormals,
@@ -40,6 +41,9 @@ from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkRenderingAnnotation import vtkAxesActor
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
+    vtkActor2D,
+    vtkImageActor,
+    vtkPolyDataMapper2D,
     vtkBillboardTextActor3D,
     vtkCellPicker,
     vtkPolyDataMapper,
@@ -67,6 +71,7 @@ __all__ = [
     "vtkContourTriangulator",
     "vtkCubeSource",
     "vtkCylinderSource",
+    "vtkDelaunay2D",
     "vtkFeatureEdges",
     "vtkFloatArray",
     "vtkGlyph3D",

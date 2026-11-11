@@ -9,6 +9,68 @@ from step_explorer.step.parser import parse_step
 from step_explorer.step.values import StepAggregate, StepNumber, StepReference
 
 
+def test_helgear_general_spline_trims_preserve_boundary_edges():
+    source = Path(__file__).resolve().parents[1] / "corpus/TOUGH_stresstests/helgear2_geom.step"
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    report = assess_completeness(document, snapshot)
+    assert report.face_count == report.meshed_face_count == 18
+    assert report.open_edge_count == report.unresolved_edge_count == 0
+
+    faces = {face.entity_id: face for face in snapshot.faces}
+    face = faces[148]
+    assert len(face.triangles) < 800
+    assert not any("sliver" in reason for reason in builder.assess_face(148, face).reasons)
+    surface = builder._nonrational_spline_surface(document.entity(645))
+    parameters = [surface.project(point)[1:] for point in face.points]
+    def difference(a, b):
+        return (a.x - b.x, a.y - b.y, a.z - b.z)
+    for a, b, c in face.triangles:
+        u = sum(parameters[i][0] for i in (a, b, c)) / 3
+        v = sum(parameters[i][1] for i in (a, b, c)) / 3
+        du = (surface.u_range[1] - surface.u_range[0]) * 1e-5
+        dv = (surface.v_range[1] - surface.v_range[0]) * 1e-5
+        tangent_u = difference(surface.evaluate(min(u + du, surface.u_range[1]), v),
+                               surface.evaluate(max(u - du, surface.u_range[0]), v))
+        tangent_v = difference(surface.evaluate(u, min(v + dv, surface.v_range[1])),
+                               surface.evaluate(u, max(v - dv, surface.v_range[0])))
+        normal = builder._cross(tangent_u, tangent_v)
+        triangle_normal = builder._cross(difference(face.points[b], face.points[a]),
+                                         difference(face.points[c], face.points[a]))
+        assert builder._dot(normal, triangle_normal) > 0
+    narrow = faces[407]
+    assert len(narrow.triangles) < 400
+    assert not any("sliver" in reason for reason in builder.assess_face(407, narrow).reasons)
+    narrow_surface = builder._nonrational_spline_surface(document.entity(508))
+    narrow_uv = [narrow_surface.project(point)[1:] for point in narrow.points]
+    for a, b, c in narrow.triangles:
+        u = sum(narrow_uv[i][0] for i in (a, b, c)) / 3
+        v = sum(narrow_uv[i][1] for i in (a, b, c)) / 3
+        du = (narrow_surface.u_range[1] - narrow_surface.u_range[0]) * 1e-5
+        dv = (narrow_surface.v_range[1] - narrow_surface.v_range[0]) * 1e-5
+        tangent_u = difference(narrow_surface.evaluate(min(u + du, narrow_surface.u_range[1]), v),
+                               narrow_surface.evaluate(max(u - du, narrow_surface.u_range[0]), v))
+        tangent_v = difference(narrow_surface.evaluate(u, min(v + dv, narrow_surface.v_range[1])),
+                               narrow_surface.evaluate(u, max(v - dv, narrow_surface.v_range[0])))
+        normal = builder._cross(tangent_u, tangent_v)
+        triangle_normal = builder._cross(difference(narrow.points[b], narrow.points[a]),
+                                         difference(narrow.points[c], narrow.points[a]))
+        assert builder._dot(normal, triangle_normal) > 0
+    for face_id in (129, 138, 148, 281, 285, 323, 751, 821):
+        face = faces[face_id]
+        incidence = {}
+        for triangle in face.triangles:
+            for a, b in zip(triangle, (triangle[1], triangle[2], triangle[0])):
+                edge = tuple(sorted((a, b)))
+                incidence[edge] = incidence.get(edge, 0) + 1
+        boundary = [edge for edge, count in incidence.items() if count == 1]
+        assert boundary
+        assert all(count <= 2 for count in incidence.values())
+        assert all(builder._distance(face.points[a], face.points[b]) > 1e-9 for a, b in boundary)
+        assert len(face.points) > len(boundary)
+
+
 def test_closed_loft_with_independently_sampled_rails_is_meshed():
     source = Path(__file__).resolve().parents[1] / "corpus/complex_bspline/circlesloft1.STEP"
     document = parse_step(source.read_text(encoding="utf-8"))
