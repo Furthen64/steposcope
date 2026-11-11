@@ -114,6 +114,39 @@ def test_analysis_uses_complete_model_when_face_has_forward_references():
     window._show_snapshot.assert_called_once_with(window._analysis_snapshot, face.entity_id)
 
 
+def test_analysis_reuses_complete_snapshot():
+    source = Path(__file__).resolve().parents[1] / "tests/corpus/analytic_curved/cylindercut1.STEP"
+    document = StepDocument.from_file(source)
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    face = next(entity for entity in document.entities if entity.type_name == "ADVANCED_FACE")
+    builder.build = Mock(side_effect=AssertionError("complete model must not be rebuilt"))
+    window = SimpleNamespace(
+        document=document, current_id=face.entity_id, geometry_builder=builder,
+        current_snapshot=snapshot, discovered_order=len(document.entities) - 1,
+        viewport=SimpleNamespace(set_face_analysis=Mock()),
+        _show_snapshot=Mock(), _update_face_analysis_actions=Mock(),
+    )
+
+    MainWindow._analyze_current_face(window)
+
+    assert window._analysis_snapshot is snapshot
+    builder.build.assert_not_called()
+
+
+def test_dense_analysis_control_net_has_bounded_labels(view):
+    rows = tuple(tuple(Point3(float(i), float(j), 0) for j in range(80)) for i in range(80))
+    net = ControlNet(42, rows)
+    view._label_specs = []
+    view._active_label_orders = {}
+    view._active_label_time = 0
+
+    view._add_control_net(net, False, False, 1.0, "", highlighted=True, point_labels=True)
+
+    assert len(view._label_specs) <= 24
+    assert not any(label.force_visible for label in view._label_specs)
+
+
 def test_face_analysis_opacity_and_normal_length_affect_actors(view):
     mesh = Mesh(7, (Point3(0, 0, 0), Point3(1, 0, 0), Point3(0, 1, 0)), ((0, 1, 2),))
     view._analysis_face_id = 7

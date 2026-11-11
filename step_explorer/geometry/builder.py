@@ -2695,7 +2695,7 @@ class GeometryBuilder:
     def _unequal_cylindrical_strip_mesh(
         self, surface: StepEntity, first: tuple[Point3, ...], second: tuple[Point3, ...]
     ) -> tuple[tuple[Point3, ...], tuple[tuple[int, int, int], ...]] | None:
-        """Join unequal samples of the same cylindrical arc without a UV fan."""
+        """Join unequal samples of matching cylinder arcs, including full-turn rims."""
 
         if self._distance(first[0], second[0]) > self._distance(first[0], second[-1]):
             second = tuple(reversed(second))
@@ -2732,6 +2732,12 @@ class GeometryBuilder:
         first_angles, second_angles = angles(first), angles(second)
         if first_angles is None or second_angles is None:
             return None
+        if ((first_angles[-1] - first_angles[0])
+                * (second_angles[-1] - second_angles[0]) < 0):
+            second = tuple(reversed(second))
+            second_angles = angles(second)
+            if second_angles is None:
+                return None
         if first_angles[-1] < first_angles[0]:
             first, second = tuple(reversed(first)), tuple(reversed(second))
             first_angles, second_angles = angles(first), angles(second)
@@ -2739,7 +2745,7 @@ class GeometryBuilder:
         second_angles = [value + shift for value in second_angles]
         if (abs(first_angles[0] - second_angles[0]) > 1e-5
                 or abs(first_angles[-1] - second_angles[-1]) > 1e-5
-                or first_angles[-1] - first_angles[0] >= 2 * math.pi - 1e-6
+                or first_angles[-1] - first_angles[0] > 2 * math.pi + 1e-6
                 or any(rail[i + 1] <= rail[i] + 1e-9 for rail in (first_angles, second_angles)
                        for i in range(len(rail) - 1))):
             return None
@@ -3149,6 +3155,9 @@ class GeometryBuilder:
                 return None
             uv_boundary.append(Point3(u, v, 0.0))
             previous_uv = (u, v)
+        quality_mesh = self._spline_delaunay_mesh(evaluator, boundary, uv_boundary)
+        if quality_mesh is not None:
+            return quality_mesh
         triangulated = self._ear_clip_loop(uv_boundary)
         if triangulated is None:
             return None
@@ -3738,6 +3747,10 @@ class GeometryBuilder:
             return None
         uv_points, triangles = triangulated
         triangles = self._consistent_uv_winding(uv_points, triangles)
+        if len(uv_loops) > 1:
+            improved = self._improve_cylindrical_trim(uv_points, triangles, points, uv_loops, radius, surface_point)
+            if improved is not None:
+                return improved
         # Keep the original STEP trim samples on shared edges.  They are
         # already within tolerance of the cylinder; projecting them here
         # would make adjacent faces disagree along a shared B-spline edge.
@@ -3745,6 +3758,97 @@ class GeometryBuilder:
             points, uv_points, triangles, [len(loop) for loop in loops],
             surface_point, max(radius * 0.18, 1e-6),
         )
+
+    @staticmethod
+    def _improve_cylindrical_trim(uv_points, triangles, boundary, loops, radius, surface_point):
+        """Add interior vertices and improve edges while retaining all trim segments."""
+        xy = [(p.x * radius, p.y) for p in uv_points]
+        xmin, xmax = min(p[0] for p in xy), max(p[0] for p in xy)
+        ymin, ymax = min(p[1] for p in xy), max(p[1] for p in xy)
+        scale = max(xmax - xmin, ymax - ymin)
+        if scale <= 1e-12:
+            return None
+        xy = [((x - xmin) / scale, (y - ymin) / scale) for x, y in xy]
+        points = list(boundary)
+        def cross(a, b, c):
+            return ((xy[b][0] - xy[a][0]) * (xy[c][1] - xy[a][1])
+                    - (xy[b][1] - xy[a][1]) * (xy[c][0] - xy[a][0]))
+        faces = []
+        for a, b, c in triangles:
+            area = cross(a, b, c)
+            if abs(area) < 1e-16:
+                return None
+            faces.append((a, b, c) if area > 0 else (a, c, b))
+        original_area = math.fsum(cross(*face) for face in faces)
+        constrained = set()
+        offset = 0
+        for loop in loops:
+            constrained.update(tuple(sorted((offset + i, offset + (i + 1) % len(loop))))
+                               for i in range(len(loop)))
+            offset += len(loop)
+        spacing = 1 / 24
+        nx = max(1, math.ceil((xmax - xmin) / scale / spacing))
+        ny = max(1, math.ceil((ymax - ymin) / scale / spacing))
+        for i in range(nx):
+            for j in range(ny):
+                x = (i + 0.5) * (xmax - xmin) / scale / nx
+                y = (j + 0.5) * (ymax - ymin) / scale / ny
+                xy.append((x, y))
+                index = len(xy) - 1
+                match = next((k for k, (a, b, c) in enumerate(faces)
+                              if min(cross(a, b, index), cross(b, c, index), cross(c, a, index)) > 1e-8), None)
+                if match is None:
+                    xy.pop()
+                    continue
+                a, b, c = faces[match]
+                faces[match] = (a, b, index)
+                faces.extend(((b, c, index), (c, a, index)))
+                parameter = Point3((xmin + x * scale) / radius, ymin + y * scale, 0)
+                points.append(surface_point(parameter))
+        # Lawson edge flips reduce thin fans without changing the contour.
+        for _ in range(40):
+            edges = {}
+            for index, (a, b, c) in enumerate(faces):
+                for p, q, other in ((a, b, c), (b, c, a), (c, a, b)):
+                    edges.setdefault(tuple(sorted((p, q))), []).append((index, other))
+            changed = False
+            used = set()
+            for (a, b), incidents in edges.items():
+                if (a, b) in constrained or len(incidents) != 2:
+                    continue
+                (i, c), (j, d) = incidents
+                if i in used or j in used or cross(c, d, a) * cross(c, d, b) >= -1e-20:
+                    continue
+                if cross(a, b, c) < 0:
+                    a, b = b, a
+                ax, ay = xy[a][0] - xy[d][0], xy[a][1] - xy[d][1]
+                bx, by = xy[b][0] - xy[d][0], xy[b][1] - xy[d][1]
+                cx, cy = xy[c][0] - xy[d][0], xy[c][1] - xy[d][1]
+                determinant = ((ax * ax + ay * ay) * (bx * cy - by * cx)
+                               - (bx * bx + by * by) * (ax * cy - ay * cx)
+                               + (cx * cx + cy * cy) * (ax * by - ay * bx))
+                if determinant <= 1e-14:
+                    continue
+                first, second = (c, d, a), (d, c, b)
+                if cross(*first) < 0:
+                    first = (first[0], first[2], first[1])
+                if cross(*second) < 0:
+                    second = (second[0], second[2], second[1])
+                faces[i], faces[j] = first, second
+                used.update((i, j))
+                changed = True
+            if not changed:
+                break
+        incidence = {}
+        for a, b, c in faces:
+            for edge in ((a, b), (b, c), (c, a)):
+                edge = tuple(sorted(edge))
+                incidence[edge] = incidence.get(edge, 0) + 1
+        if ({edge for edge, count in incidence.items() if count == 1} != constrained
+                or any(count > 2 for count in incidence.values())
+                or abs(math.fsum(cross(*face) for face in faces) - original_area) > original_area * 1e-8):
+            return None
+        return tuple(points), tuple(faces)
 
     @staticmethod
     def _periodic_cylindrical_trim_mesh(

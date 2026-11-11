@@ -1371,7 +1371,7 @@ class VtkView(QWidget):
             snapshot.faces, getattr(self, "normal_arrow_limit", self.DEFAULT_NORMAL_ARROW_LIMIT),
         )
         analysis_active = self._analysis_face_id is not None
-        self._batch_positions = self._last_show_points and not analysis_active
+        self._batch_positions = self._last_show_points
         show_normals = (
             getattr(self, "normal_display", "Hidden") == "Vectors"
             or (analysis_active and self._analysis_show_normals)
@@ -1617,12 +1617,14 @@ class VtkView(QWidget):
         selected = selected_id == entity_id
         self._active_entity_id = entity_id
         label_text = self._label_text(entity_id, label_mode, label_texts)
+        if analysis_active:
+            labels = False
         if kind in {"point", "vertex"}:
             category = "Geometry" if kind == "point" else "Topology"
             boundary_vertex = analysis_active and entity_id in self._analysis_boundary_vertex_ids
             if not show_points and not boundary_vertex:
                 return
-            if self._batch_positions and not selected:
+            if self._batch_positions and not selected and not boundary_vertex:
                 if labels:
                     self._add_label(
                         entity_id, (item.x, item.y, item.z), color_for_category(category),
@@ -1641,7 +1643,7 @@ class VtkView(QWidget):
                 f"#{entity_id}" if boundary_vertex else label_text,
                 dimmed=analysis_active and not boundary_vertex,
                 highlighted=boundary_vertex,
-                force_label=boundary_vertex,
+                force_label=False,
             )
         elif kind == "polyline":
             boundary_edge = analysis_active and entity_id in self._analysis_boundary_edge_ids
@@ -2157,7 +2159,9 @@ class VtkView(QWidget):
             points.SetDataTypeToDouble()
             cells = vtk.vtkCellArray()
             for entity_id, (item_kind, item) in self._rendered_items.items():
-                if item_kind != kind or entity_id == selected_id:
+                if (item_kind != kind or entity_id == selected_id
+                        or (self._analysis_face_id is not None
+                            and entity_id in self._analysis_boundary_vertex_ids)):
                     continue
                 index = points.InsertNextPoint(item.x, item.y, item.z)
                 cells.InsertNextCell(1)
@@ -2171,8 +2175,11 @@ class VtkView(QWidget):
             mapper.SetInputData(data)
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
-            actor.GetProperty().SetPointSize(6)
-            actor.GetProperty().SetColor(*color_for_category(category))
+            actor.GetProperty().SetPointSize(4 if self._analysis_face_id is not None else 6)
+            actor.GetProperty().SetColor(*((0.48, 0.50, 0.53) if self._analysis_face_id is not None
+                                           else color_for_category(category)))
+            if self._analysis_face_id is not None:
+                actor.GetProperty().SetOpacity(self._analysis_context_opacity)
             self.renderer.AddActor(actor)
             self._register_actor(actor)
             self._position_batch_actors.append(actor)
@@ -2296,8 +2303,12 @@ class VtkView(QWidget):
                 dimmed=dimmed,
             )
         if point_labels:
+            total = control_net.row_count * control_net.column_count
+            stride = max(1, (total + 23) // 24)
             for row_index, row in enumerate(control_net.rows):
                 for column_index, point in enumerate(row):
+                    if (row_index * control_net.column_count + column_index) % stride:
+                        continue
                     point_id = (
                         control_net.point_ids[row_index][column_index]
                         if control_net.point_ids else None
@@ -2312,7 +2323,7 @@ class VtkView(QWidget):
                         text,
                         True,
                         0,
-                        force_visible=True,
+                        force_visible=False,
                     )
 
     def _add_mesh(

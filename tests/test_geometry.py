@@ -1,12 +1,102 @@
 import math
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
 from step_explorer.geometry import ControlNet, ControlNetStatus, GeometryBuilder, Point3
 from step_explorer.geometry.completeness import assess_completeness
+from step_explorer.headless import build_report
 from step_explorer.step.parser import parse_step
 from step_explorer.step.values import StepAggregate, StepNumber, StepReference
+
+
+@pytest.mark.parametrize(("filename", "face_id"), [
+    ("box_2holecuts_rounded_top.step", 492),
+    ("box_3cuts_rounded_top.step", 477),
+])
+def test_rounded_top_with_multiple_holes_has_smooth_consistent_mesh(filename, face_id):
+    source = Path(__file__).resolve().parents[1] / "corpus/TOUGH_stresstests" / filename
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    report = build_report(source, document, snapshot.faces)["solids"][0]
+    assert report["verdict"] == "consistent"
+    assert report["n_boundary_edges"] == 0
+    face = next(face for face in snapshot.faces if face.entity_id == face_id)
+    for a, b, c in face.triangles:
+        p, q, r = (face.points[i] for i in (a, b, c))
+        normal = builder._cross((q.x - p.x, q.y - p.y, q.z - p.z),
+                                (r.x - p.x, r.y - p.y, r.z - p.z))
+        radial = (0, (p.y + q.y + r.y) / 3, (p.z + q.z + r.z) / 3 + 108.326828837)
+        lengths = math.sqrt(builder._dot(normal, normal) * builder._dot(radial, radial))
+        assert lengths > 0
+        assert builder._dot(normal, radial) / lengths > 0.99
+
+
+def test_cylindrical_hole_with_curved_full_turn_rim_is_watertight():
+    source = Path(__file__).resolve().parents[1] / "corpus/TOUGH_stresstests/box_holecut_rounded_top.step"
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    assert assess_completeness(document, snapshot).meshed_face_count == 7
+    solid = build_report(source, document, snapshot.faces)["solids"][0]
+    assert solid["verdict"] == "consistent"
+    assert solid["n_boundary_edges"] == 0
+    face = next(face for face in snapshot.faces if face.entity_id == 314)
+    assert len(face.triangles) >= 200
+    assert all(abs(math.hypot(p.x, p.y) - 4.236482604) < 2e-4 for p in face.points)
+    for a, b, c in face.triangles:
+        p, q, r = (face.points[i] for i in (a, b, c))
+        normal = builder._cross((q.x - p.x, q.y - p.y, q.z - p.z),
+                                (r.x - p.x, r.y - p.y, r.z - p.z))
+        assert normal[0] * (p.x + q.x + r.x) + normal[1] * (p.y + q.y + r.y) < 0
+
+
+def test_sheet_thickened_spline_face_has_well_distributed_surface_mesh():
+    source = Path(__file__).resolve().parent / "corpus/TOUGH_stresstests/sheet_thickened.step"
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    boundaries = {}
+    original = builder._spline_delaunay_mesh
+    def capture_boundary(surface, boundary, uv_boundary):
+        mesh = original(surface, boundary, uv_boundary)
+        if mesh is not None:
+            boundaries[id(mesh[0])] = tuple(boundary)
+        return mesh
+    builder._spline_delaunay_mesh = capture_boundary
+    snapshot = builder.build()
+    assert assess_completeness(document, snapshot).meshed_face_count == 6
+    face = next(face for face in snapshot.faces if face.entity_id == 5566)
+    boundary = boundaries[id(face.points)]
+    incidence = Counter(tuple(sorted(edge)) for triangle in face.triangles
+                        for edge in zip(triangle, (triangle[1], triangle[2], triangle[0])))
+    expected = {tuple(sorted((i, (i + 1) % len(boundary)))) for i in range(len(boundary))}
+    assert {edge for edge, count in incidence.items() if count == 1} == expected
+    assert face.points[:len(boundary)] == boundary
+    # A boundary fan concentrates hundreds of triangles on one vertex.
+    assert max(Counter(index for triangle in face.triangles for index in triangle).values()) <= 12
+    surface = builder._nonrational_spline_surface(document.entity(5559))
+    uv = [surface.project(point)[1:] for point in face.points]
+    scale = max(max(getattr(point, axis) for point in face.points)
+                - min(getattr(point, axis) for point in face.points) for axis in "xyz")
+    du = (surface.u_range[1] - surface.u_range[0]) * 1e-5
+    dv = (surface.v_range[1] - surface.v_range[0]) * 1e-5
+    def diff(a, b):
+        return (a.x - b.x, a.y - b.y, a.z - b.z)
+    for a, b, c in face.triangles:
+        u = sum(uv[i][0] for i in (a, b, c)) / 3
+        v = sum(uv[i][1] for i in (a, b, c)) / 3
+        p, q, r = (face.points[i] for i in (a, b, c))
+        tangent_u = diff(surface.evaluate(min(u + du, surface.u_range[1]), v),
+                         surface.evaluate(max(u - du, surface.u_range[0]), v))
+        tangent_v = diff(surface.evaluate(u, min(v + dv, surface.v_range[1])),
+                         surface.evaluate(u, max(v - dv, surface.v_range[0])))
+        assert builder._dot(builder._cross(diff(q, p), diff(r, p)),
+                            builder._cross(tangent_u, tangent_v)) > 0
+        exact = surface.evaluate(u, v)
+        centroid = Point3((p.x + q.x + r.x) / 3, (p.y + q.y + r.y) / 3, (p.z + q.z + r.z) / 3)
+        assert builder._distance(exact, centroid) < scale * 0.002
 
 
 def test_helgear_general_spline_trims_preserve_boundary_edges():

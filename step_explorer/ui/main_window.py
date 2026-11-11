@@ -25,7 +25,7 @@ from .preferences import PreferencesDialog
 from .step_lines import STEP_LINE_PALETTES
 from ..visualization.vtk_view import VtkView
 
-from PySide6.QtCore import QEvent, QPropertyAnimation, QSettings, QTimer, Qt, QUrl
+from PySide6.QtCore import QEvent, QEventLoop, QPropertyAnimation, QSettings, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QProgressDialog,
     QSplitter,
     QComboBox,
     QCheckBox,
@@ -79,6 +80,24 @@ def _label_for_entity_type(type_name: str) -> str:
     if "SURFACE" in name:
         return "Surface"
     return type_name.replace("_", " ").title()
+
+
+class _FaceAnalysisProgress:
+    enabled = True
+
+    def __init__(self, dialog):
+        self.dialog = dialog
+
+    def item(self, done, total, label):
+        self.dialog.setRange(0, total)
+        self.dialog.setLabelText(f"Preparing {label}: {done}/{total}")
+        self.dialog.setValue(done)
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def end_item(self):
+        self.dialog.setRange(0, 0)
+        self.dialog.setLabelText("Preparing face inspection…")
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
 
 class MainWindow(QMainWindow):
@@ -2162,17 +2181,39 @@ class MainWindow(QMainWindow):
         )
         builder = self.geometry_builder or GeometryBuilder(self.document)
         boundary_edge_ids, boundary_vertex_ids = builder.face_boundary_entity_ids(face.entity_id)
-        self._analysis_snapshot = builder.build()
-        self.analyzed_face_id = face.entity_id
-        self.viewport.set_face_analysis(
-            face.entity_id,
-            surface_id,
-            boundary_edge_ids,
-            boundary_vertex_ids,
-            refresh=False,
-        )
-        self._show_snapshot(self._analysis_snapshot, face.entity_id)
-        self._update_face_analysis_actions(face)
+        complete = (getattr(self, "current_snapshot", None) is not None
+                    and getattr(self, "discovered_order", -1) >= len(self.document.entities) - 1)
+        dialog = None
+        if isinstance(self, MainWindow) and QApplication.instance() is not None:
+            dialog = QProgressDialog("Preparing face inspection…", "", 0, 0, self)
+            dialog.setWindowTitle("Face analysis")
+            dialog.setCancelButton(None)
+            dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.show()
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        try:
+            if complete:
+                self._analysis_snapshot = self.current_snapshot
+            elif dialog is not None:
+                self._analysis_snapshot = builder.build(progress=_FaceAnalysisProgress(dialog))
+            else:
+                self._analysis_snapshot = builder.build()
+            self.analyzed_face_id = face.entity_id
+            self.viewport.set_face_analysis(
+                face.entity_id,
+                surface_id,
+                boundary_edge_ids,
+                boundary_vertex_ids,
+                refresh=False,
+            )
+            self._show_snapshot(self._analysis_snapshot, face.entity_id)
+            self._update_face_analysis_actions(face)
+        finally:
+            if dialog is not None:
+                dialog.close()
 
     def _exit_face_analysis(self):
         self.analyzed_face_id = None
