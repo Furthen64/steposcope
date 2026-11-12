@@ -6,7 +6,7 @@ from step_explorer.geometry.builder import GeometryBuilder, Mesh, Point3
 from step_explorer.step.parser import parse_step
 from step_explorer.ui.main_window import MainWindow
 from step_explorer.visualization.vtk_view import VtkView, vtk
-from PySide6.QtWidgets import QComboBox
+from PySide6.QtWidgets import QComboBox, QPushButton, QWidget
 
 from test_headless import _box_source
 
@@ -55,6 +55,45 @@ def test_orientation_balloon_click_opens_face_diagnostic(qapp, view):
     builder.heal_orientations = True
     view._update_warning_balloons(builder.build())
     assert view._warning_balloons == []
+
+
+def test_warning_labels_are_unique_stable_and_toggleable(qapp, view):
+    builder = GeometryBuilder(parse_step(_box_source(flipped_face=2)), heal_orientations=False)
+    snapshot = builder.build()
+    flagged = next(mesh for mesh in snapshot.faces if mesh.orientation_warning)
+    snapshot.faces.append(flagged)
+    view._update_warning_balloons(snapshot)
+    assert len(view._warning_balloons) == 1
+    button, _ = view._warning_balloons[0]
+    view._update_warning_balloons(snapshot)
+    assert view._warning_balloons[0][0] is button
+    view.set_show_warning_labels(False)
+    assert button.isHidden()
+    view._position_warning_balloons = Mock()
+    view.set_show_warning_labels(True)
+    assert view.show_warning_labels
+    view._position_warning_balloons.assert_called_once_with()
+
+
+def test_overlapping_warning_labels_do_not_move_again_on_each_render(qapp, monkeypatch):
+    canvas = QWidget()
+    canvas.resize(500, 400)
+    canvas.GetRenderWindow = lambda: SimpleNamespace(GetSize=lambda: (500, 400))
+    buttons = [QPushButton("Warning", canvas) for _ in range(2)]
+    for button in buttons:
+        button.resize(100, 30)
+    renderer = SimpleNamespace(SetWorldPoint=Mock(), WorldToDisplay=Mock(),
+                               GetDisplayPoint=lambda: (200, 200, 0.5))
+    view = SimpleNamespace(show_warning_labels=True, widget=canvas, renderer=renderer,
+                           _warning_balloons=[(button, (0, 0, 0)) for button in buttons])
+    VtkView._position_warning_balloons(view)
+    assert not buttons[0].geometry().intersects(buttons[1].geometry())
+    moves = [Mock(wraps=button.move) for button in buttons]
+    for button, move in zip(buttons, moves):
+        monkeypatch.setattr(button, "move", move)
+    VtkView._position_warning_balloons(view)
+    assert all(move.call_count == 0 for move in moves)
+    canvas.close()
 
 
 def test_heal_toggle_rebuilds_current_preview():

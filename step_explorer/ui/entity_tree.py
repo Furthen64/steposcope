@@ -30,6 +30,7 @@ class EntityTree(QTreeWidget):
         self.step_line_palette = "Classic"
         self.step_line_emojis = True
         self.step_line_color_source = False
+        self.filter_text = ""
 
     def set_step_line_appearance(self, palette: str, show_emojis: bool, color_source: bool) -> None:
         self.step_line_palette = palette
@@ -114,6 +115,34 @@ class EntityTree(QTreeWidget):
                 self.items_by_id.setdefault(entity.entity_id, item)
                 self.visible_entity_ids.append(entity.entity_id)
         self.expandToDepth(1)
+        self._apply_filter()
+
+    def set_filter_text(self, text: str) -> None:
+        self.filter_text = text.strip().casefold()
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        if self.document is None:
+            return
+
+        def update_item(item):
+            child_matches = False
+            for index in range(item.childCount()):
+                child_matches = update_item(item.child(index)) or child_matches
+            entity_id = item.data(0, Qt.ItemDataRole.UserRole)
+            entity = self.document.entity(entity_id) if entity_id is not None else None
+            matches = not self.filter_text or (entity is not None and
+                (self.filter_text in entity.type_name.casefold()
+                 or self.filter_text in f"#{entity.entity_id}"
+                 or self.filter_text in entity.raw.casefold()))
+            visible = matches or child_matches
+            item.setHidden(not visible)
+            if self.filter_text and child_matches:
+                item.setExpanded(True)
+            return visible
+
+        for index in range(self.topLevelItemCount()):
+            update_item(self.topLevelItem(index))
 
     def set_playback_step_time(self, entity_id: int, elapsed_ms: float) -> None:
         self.playback_step_ms[entity_id] = elapsed_ms
@@ -126,13 +155,13 @@ class EntityTree(QTreeWidget):
     @timed("ui.tree_focus")
     def focus_playback_entity(self, entity_id: int) -> None:
         item = self.playback_items.get(entity_id)
-        if item is not None:
+        if item is not None and not item.isHidden():
             self.setCurrentItem(item)
             self.scrollToItem(item)
 
     def focus_entity(self, entity_id: int) -> None:
         item = self.items_by_id.get(entity_id)
-        if item is not None:
+        if item is not None and not item.isHidden():
             self.setCurrentItem(item)
             self.scrollToItem(item)
 

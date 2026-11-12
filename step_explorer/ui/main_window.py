@@ -26,12 +26,13 @@ from .step_lines import STEP_LINE_PALETTES
 from ..visualization.vtk_view import VtkView
 
 from PySide6.QtCore import QEvent, QEventLoop, QPropertyAnimation, QSettings, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -136,6 +137,7 @@ class MainWindow(QMainWindow):
         self.orbit_method = self._load_orbit_method()
         self.show_entity_labels = self._load_show_entity_labels()
         self.show_positions = self.settings.value("show_positions", True, type=bool)
+        self.show_warning_labels = self.settings.value("show_warning_labels", True, type=bool)
         self.show_xyz_origin = self._load_show_xyz_origin()
         self.show_xy_grid = self._load_show_xy_grid()
         self.show_mesh_edges = bool(self.settings.value("show_mesh_edges", False, type=bool))
@@ -384,6 +386,7 @@ class MainWindow(QMainWindow):
             show_xyz_origin=self.show_xyz_origin,
             show_xy_grid=self.show_xy_grid,
             show_mesh_edges=self.show_mesh_edges,
+            show_warning_labels=self.show_warning_labels,
             mesh_edge_opacity=self.mesh_edge_opacity / 100,
             xy_grid_color=self.xy_grid_color,
             xy_grid_scale=self.xy_grid_scale,
@@ -546,25 +549,6 @@ class MainWindow(QMainWindow):
         )
         self.shape_expectation_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.shape_expectation_label.hide()
-        self.paused_preview_panel = QFrame(self.shape_expectation_label.parentWidget())
-        self.paused_preview_panel.setObjectName("pausedPreview")
-        self.paused_preview_panel.setStyleSheet(
-            "QFrame#pausedPreview { background: #20242a; border: 1px solid #68717c; border-radius: 5px; }"
-            "QLabel { color: #f2f4f8; border: none; }"
-        )
-        self.paused_preview_panel.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        preview_layout = QVBoxLayout(self.paused_preview_panel)
-        preview_layout.setContentsMargins(6, 5, 6, 6)
-        preview_layout.setSpacing(4)
-        self.paused_preview_caption = QLabel("Last paused view", self.paused_preview_panel)
-        self.paused_preview_image = QLabel(self.paused_preview_panel)
-        self.paused_preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.paused_preview_image.setMinimumSize(1, 1)
-        preview_layout.addWidget(self.paused_preview_caption)
-        preview_layout.addWidget(self.paused_preview_image, 1)
-        self._paused_preview_pixmap = None
-        self._paused_preview_size = None
-        self.paused_preview_panel.hide()
         self._build_file_menu()
         self._build_ui()
         self._connect_signals()
@@ -883,6 +867,11 @@ class MainWindow(QMainWindow):
             f"background-color: {color.name()}; color: {text_color}; "
             "border: 1px solid #555555; padding: 3px 6px; }"
         )
+
+    def _show_warning_labels_changed(self, enabled: bool):
+        self.show_warning_labels = enabled
+        self.settings.setValue("show_warning_labels", enabled)
+        self.viewport.set_show_warning_labels(enabled)
 
     def _show_entity_labels_changed(self, enabled: bool):
         self.show_entity_labels = enabled
@@ -1379,6 +1368,11 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.show_mesh_edges_action)
         toolbar.addAction(self.show_positions_action)
+        self.show_warning_labels_checkbox = QCheckBox("Show warning labels")
+        self.show_warning_labels_checkbox.setChecked(self.show_warning_labels)
+        self.show_warning_labels_checkbox.setToolTip("Show possible wrong normal labels on faces")
+        self.show_warning_labels_checkbox.toggled.connect(self._show_warning_labels_changed)
+        toolbar.addWidget(self.show_warning_labels_checkbox)
         self.preferences_button = QToolButton(self.menuBar())
         self.preferences_button.setObjectName("preferencesButton")
         self.preferences_button.setText("⚙")
@@ -1418,7 +1412,17 @@ class MainWindow(QMainWindow):
         self.objects_group.hide()
         self.left_panel = QSplitter(Qt.Orientation.Vertical)
         self.left_panel.addWidget(self.objects_group)
-        self.left_panel.addWidget(self.tree)
+        entity_list_panel = QWidget()
+        entity_list_layout = QVBoxLayout(entity_list_panel)
+        entity_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.entity_filter = QLineEdit()
+        self.entity_filter.setPlaceholderText("Filter entities (e.g. ADVANCED_FACE)")
+        self.entity_filter.setClearButtonEnabled(True)
+        self.entity_filter.setToolTip("Filter by entity type, ID, or STEP source")
+        self.entity_filter.textChanged.connect(self.tree.set_filter_text)
+        entity_list_layout.addWidget(self.entity_filter)
+        entity_list_layout.addWidget(self.tree)
+        self.left_panel.addWidget(entity_list_panel)
         self.left_panel.setChildrenCollapsible(False)
         self.left_panel.setSizes([160, 620])
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1567,7 +1571,7 @@ class MainWindow(QMainWindow):
         self.viewport.face_picked.connect(self._viewport_face_picked)
         self.viewport.face_double_clicked.connect(self._viewport_face_double_clicked)
         self.viewport.background_clicked.connect(self._viewport_background_clicked)
-        self.viewport.orientation_warning_clicked.connect(self._show_orientation_warning)
+        self.viewport.orientation_warning_clicked.connect(self._select_orientation_warning_face)
         self.invert_mouse_horizontal_action.toggled.connect(self._invert_mouse_horizontal_changed)
         self.invert_mouse_vertical_action.toggled.connect(self._invert_mouse_vertical_changed)
         self.autozoom_action.toggled.connect(self._autozoom_changed)
@@ -1798,8 +1802,6 @@ class MainWindow(QMainWindow):
         if canvas is None:
             return
         margin = 14
-        if not self.paused_preview_panel.isHidden():
-            self._layout_paused_preview()
         if self.shape_expectation_label.parentWidget() is canvas and self.shape_expectation_label.isVisible():
             self.shape_expectation_label.adjustSize()
             self.shape_expectation_label.move(
@@ -1824,32 +1826,6 @@ class MainWindow(QMainWindow):
             self.hotkey_legend.adjustSize()
             self.hotkey_legend.move(margin, hotkey_top)
             self.hotkey_legend.raise_()
-
-    def _layout_paused_preview(self):
-        canvas = self.paused_preview_panel.parentWidget()
-        margin = 14
-        width = max(1, min(canvas.width() - 2 * margin, round(canvas.width() * 0.39)))
-        height = max(1, min(canvas.height() - 2 * margin, round(canvas.height() * 0.39)))
-        self.paused_preview_panel.setGeometry(
-            max(0, canvas.width() - width - margin), max(0, canvas.height() - height - margin), width, height
-        )
-        target = (max(1, width - 12), max(1, height - self.paused_preview_caption.sizeHint().height() - 15))
-        if self._paused_preview_pixmap is not None and target != self._paused_preview_size:
-            self.paused_preview_image.setPixmap(self._paused_preview_pixmap.scaled(
-                *target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-            ))
-            self._paused_preview_size = target
-        self.paused_preview_panel.raise_()
-
-    def _show_paused_preview(self, image):
-        if image is None or image.isNull():
-            self.paused_preview_panel.hide()
-            return
-        self._paused_preview_pixmap = QPixmap.fromImage(image)
-        self._paused_preview_size = None
-        self.paused_preview_caption.setText(f"Last paused view · step {self.playback_order + 1:,}")
-        self._layout_paused_preview()
-        self.paused_preview_panel.show()
 
     def _show_hotkey_help(self):
         self.hotkey_fade.stop()
@@ -1960,7 +1936,6 @@ class MainWindow(QMainWindow):
 
     def _playback_toggled(self, playing: bool):
         if not playing:
-            self.paused_preview_panel.hide()
             self._set_playback_navigation_locked(False)
             self._last_playback_step_finished = None
             self.playback_timer.stop()
@@ -1977,14 +1952,11 @@ class MainWindow(QMainWindow):
             return
         if self.playback_speed == 0:
             self.playback_speed_slider.setValue(1)
-        # Capture before confirmation or mode changes can hide the paused markers.
-        paused_image = self.viewport.capture_frame()
         at_end = self.playback_order >= len(self.document.entities) - 1
         if not self._confirm_playback_duration(0 if at_end else self.playback_order):
             self.play_button.setChecked(False)
             return
         self.mode.setCurrentText("Playback")
-        self._show_paused_preview(paused_image)
         if at_end:
             self._set_playback_order(0)
         else:
@@ -2395,10 +2367,6 @@ class MainWindow(QMainWindow):
                 self.document = StepDocument.from_file(path)
             self._playback_duration_confirmed = False
             self._clear_playback_updates()
-            self.paused_preview_panel.hide()
-            self._paused_preview_pixmap = None
-            self._paused_preview_size = None
-            self.paused_preview_image.clear()
         except Exception as exc:
             QMessageBox.critical(self, "Could not parse STEP file", str(exc))
             return
@@ -2593,9 +2561,15 @@ class MainWindow(QMainWindow):
         if self.details_tabs.isHidden():
             self._toggle_interpretation_panel()
 
-    def _show_orientation_warning(self, entity_id: int, message: str):
-        self.play_button.setChecked(False)
-        QMessageBox.information(self, f"Face #{entity_id} — orientation", message)
+    def _select_orientation_warning_face(self, entity_id: int, _message: str):
+        if self.document is None or self.document.entity(entity_id) is None:
+            return
+        item = self.tree.items_by_id.get(entity_id)
+        if item is not None and item.isHidden():
+            self.entity_filter.clear()
+        if item is None:
+            self.mode.setCurrentText("Playback")
+        self._viewport_face_picked(entity_id)
 
     def select_entity(self, entity_id: int):
         if not self.document or entity_id not in self.document.by_id:

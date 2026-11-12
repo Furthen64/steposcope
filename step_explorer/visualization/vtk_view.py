@@ -7,13 +7,12 @@ from colorsys import hsv_to_rgb
 from math import atan2, ceil, cos, dist, exp, floor, hypot, isfinite, log10, pi, sin, sqrt, tan
 from random import Random
 from statistics import median
-from PySide6.QtGui import QImage
 
 from ..geometry.builder import Point3
 from ..ui.colors import color_for_category
 
 try:
-    from PySide6.QtCore import QEvent, QTimer, Signal, Qt
+    from PySide6.QtCore import QEvent, QRect, QTimer, Signal, Qt
     from PySide6.QtWidgets import QLabel, QPushButton, QToolTip, QVBoxLayout, QWidget
 except ImportError:  # pragma: no cover - allows parser use without GUI extras
     QLabel = QVBoxLayout = QWidget = object  # type: ignore[misc,assignment]
@@ -123,6 +122,7 @@ class VtkView(QWidget):
         xy_grid_color: str = "#4d5966",
         xy_grid_scale: float = 1.0,
         show_mesh_edges: bool = False,
+        show_warning_labels: bool = True,
         mesh_edge_opacity: float = 0.3,
         background_color: str = "#46596d",
     ):
@@ -140,6 +140,7 @@ class VtkView(QWidget):
         self.show_xyz_origin = bool(show_xyz_origin)
         self.show_xy_grid = bool(show_xy_grid)
         self.show_mesh_edges = bool(show_mesh_edges)
+        self.show_warning_labels = bool(show_warning_labels)
         self.mesh_edge_opacity = max(0.0, min(1.0, float(mesh_edge_opacity)))
         self.xy_grid_color = self._parse_hex_color(xy_grid_color) or (0.30, 0.35, 0.40)
         self.background_color = self._parse_hex_color(background_color) or (0.27, 0.35, 0.43)
@@ -334,23 +335,6 @@ class VtkView(QWidget):
             self._playback_notice.move(14, max(14, self.widget.height() - self._playback_notice.height() - 14))
             self._playback_notice.setVisible(locked)
             self._playback_notice.raise_()
-
-    @timed("viewport.capture_preview")
-    def capture_frame(self):
-        """Copy the last rendered frame as PNG, excluding Qt overlays."""
-        if not self._initialized or self.renderer is None:
-            return None
-        capture = vtk.vtkWindowToImageFilter()
-        capture.SetInput(self.widget.GetRenderWindow())
-        capture.SetInputBufferTypeToRGB()
-        capture.ReadFrontBufferOff()
-        capture.ShouldRerenderOff()
-        writer = vtk.vtkPNGWriter()
-        writer.SetInputConnection(capture.GetOutputPort())
-        writer.WriteToMemoryOn()
-        writer.Write()
-        image = QImage.fromData(memoryview(writer.GetResult()).tobytes(), "PNG")
-        return None if image.isNull() else image
 
     def eventFilter(self, watched, event):
         if watched in {self, getattr(self, "widget", None)} and self.playback_locked:
@@ -1702,36 +1686,48 @@ class VtkView(QWidget):
         self._actors = [actor for actor in self._actors if id(actor) not in removed]
         self._mesh_edge_actors = [actor for actor in self._mesh_edge_actors if id(actor) not in removed]
 
+    def set_show_warning_labels(self, enabled: bool) -> None:
+        self.show_warning_labels = bool(enabled)
+        if not enabled:
+            for button, _ in getattr(self, "_warning_balloons", ()):
+                button.hide()
+        else:
+            self._position_warning_balloons()
+
     @timed("viewport.warnings")
     def _update_warning_balloons(self, snapshot, changed_face_ids=None) -> None:
-        if changed_face_ids is not None:
-            removed_buttons = set()
-            for entity_id in changed_face_ids:
-                existing = self._warning_balloons_by_id.pop(entity_id, None)
-                if existing is not None:
-                    button, _ = existing
-                    button.hide()
-                    button.deleteLater()
-                    removed_buttons.add(id(button))
-            self._warning_balloons = [
-                pair for pair in self._warning_balloons
-                if id(pair[0]) not in removed_buttons
-            ]
-            for entity_id in sorted(changed_face_ids):
+        if changed_face_ids is None:
+            meshes = {mesh.entity_id: mesh for mesh in snapshot.faces}
+            affected = set(self._warning_balloons_by_id) | set(meshes)
+        else:
+            affected = set(changed_face_ids)
+            meshes = {}
+            for entity_id in affected:
                 record = self._rendered_items.get(entity_id)
-                mesh = record[1] if record is not None and record[0] == "face" else None
+                if record is not None and record[0] == "face":
+                    meshes[entity_id] = record[1]
+        for entity_id in sorted(affected):
+            mesh = meshes.get(entity_id)
+            warning = getattr(mesh, "orientation_warning", None)
+            anchor = self._warning_anchor(mesh) if warning and mesh.points else None
+            existing = self._warning_balloons_by_id.get(entity_id)
+            if existing is not None:
+                button, old_anchor = existing
+                if anchor == old_anchor and button.property("warning_message") == warning:
+                    continue
+                button.hide()
+                button.deleteLater()
+                self._warning_balloons.remove(existing)
+                del self._warning_balloons_by_id[entity_id]
+            if anchor is not None:
                 self._add_warning_balloon(mesh)
-            self._position_warning_balloons()
-            return
-
-        for button, _ in self._warning_balloons:
-            button.hide()
-            button.deleteLater()
-        self._warning_balloons = []
-        self._warning_balloons_by_id = {}
-        for mesh in snapshot.faces:
-            self._add_warning_balloon(mesh)
         self._position_warning_balloons()
+
+    @staticmethod
+    def _warning_anchor(mesh):
+        indices = mesh.triangles[0] if mesh.triangles else (0,)
+        return tuple(sum(getattr(mesh.points[i], axis) for i in indices) / len(indices)
+                     for axis in ("x", "y", "z"))
 
     def _add_warning_balloon(self, mesh) -> None:
         if mesh is None:
@@ -1739,11 +1735,14 @@ class VtkView(QWidget):
         warning = getattr(mesh, "orientation_warning", None)
         if not warning or not mesh.points:
             return
-        if len(self._warning_balloons) >= 50:
+        if mesh.entity_id in self._warning_balloons_by_id or len(self._warning_balloons) >= 50:
             return
         button = QPushButton(f"#{mesh.entity_id} possible wrong normal  ⓘ", self.widget)
+        # VTK renders into a native window; a native child stays above its frames.
+        button.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        button.setProperty("warning_message", warning)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setToolTip("Click for orientation details")
+        button.setToolTip("Click to select this face in the entity list")
         button.setStyleSheet(
             "QPushButton { background: #fff1bd; color: #302713; border: 1px solid #d69a23; "
             "border-radius: 10px; padding: 6px 10px; } "
@@ -1754,15 +1753,12 @@ class VtkView(QWidget):
                 self.orientation_warning_clicked.emit(entity_id, message)
         )
         button.adjustSize()
-        indices = mesh.triangles[0] if mesh.triangles else (0,)
-        anchor = tuple(sum(getattr(mesh.points[i], axis) for i in indices) / len(indices)
-                       for axis in ("x", "y", "z"))
-        pair = (button, anchor)
+        pair = (button, self._warning_anchor(mesh))
         self._warning_balloons.append(pair)
         self._warning_balloons_by_id[mesh.entity_id] = pair
 
     def _position_warning_balloons(self, *_args) -> None:
-        if not getattr(self, "_warning_balloons", None):
+        if not self.show_warning_labels or not getattr(self, "_warning_balloons", None):
             return
         render_width, render_height = self.widget.GetRenderWindow().GetSize()
         if render_width <= 0 or render_height <= 0:
@@ -1779,15 +1775,18 @@ class VtkView(QWidget):
             y = round((render_height - y) * self.widget.height() / render_height)
             x = max(0, min(x + 12, self.widget.width() - button.width()))
             y = max(0, min(y - button.height() - 12, self.widget.height() - button.height()))
-            button.move(x, y)
-            while any(button.geometry().intersects(rect) for rect in placed):
-                y += button.height() + 4
-                if y + button.height() > self.widget.height():
+            rect = QRect(x, y, button.width(), button.height())
+            while any(rect.intersects(other) for other in placed):
+                next_y = rect.y() + button.height() + 4
+                if next_y + button.height() > self.widget.height():
                     break
-                button.move(x, y)
-            placed.append(button.geometry())
-            button.show()
-            button.raise_()
+                rect.moveTop(next_y)
+            if button.pos() != rect.topLeft():
+                button.move(rect.topLeft())
+            placed.append(rect)
+            if button.isHidden():
+                button.show()
+                button.raise_()
 
     @staticmethod
     def _snapshot_points(snapshot, *, include_point_markers: bool = True) -> list:

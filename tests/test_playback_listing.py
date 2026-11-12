@@ -98,6 +98,39 @@ def test_playback_listing_shows_every_record_in_file_order(monkeypatch):
     assert app is not None
 
 
+def test_entity_filter_handles_playback_mode_changes_and_clearing(qapp):
+    tree = EntityTree()
+    document = _face_document()
+    tree.set_document(document, "Playback")
+    tree.set_filter_text("advanced_face")
+    assert tree.playback_items[20].isHidden()
+    assert not tree.playback_items[42].isHidden()
+    tree.focus_playback_entity(42)
+    tree.focus_playback_entity(20)
+    assert tree.currentItem() == tree.playback_items[42]
+    tree.set_document(document, "File order")
+    assert tree.items_by_id[20].isHidden()
+    assert not tree.items_by_id[42].isHidden()
+    tree.set_filter_text("#42")
+    assert tree.items_by_id[20].isHidden()
+    assert not tree.items_by_id[42].isHidden()
+    tree.set_filter_text("")
+    assert all(not tree.items_by_id[entity_id].isHidden() for entity_id in (20, 42))
+    tree.close()
+
+
+def test_semantic_filter_keeps_matching_descendant_ancestors(qapp):
+    tree = EntityTree()
+    tree.set_document(_face_document(), "Semantic")
+    tree.set_filter_text("cartesian_point")
+    root = tree.items_by_id[42]
+    child = tree.items_by_id[20]
+    assert not root.isHidden()
+    assert not child.isHidden()
+    assert root.isExpanded()
+    tree.close()
+
+
 def test_geometry_filter_keeps_spline_entities_and_skips_units(qapp):
     document = parse_step(
         "ISO-10303-21;DATA;"
@@ -150,8 +183,6 @@ def test_play_switches_to_playback_listing(monkeypatch):
         play_button=SimpleNamespace(setText=Mock()),
         _confirm_playback_duration=lambda start_order: True,
         _set_playback_navigation_locked=Mock(),
-        viewport=SimpleNamespace(capture_frame=Mock(return_value=None)),
-        _show_paused_preview=Mock(),
     )
 
     MainWindow._playback_toggled(window, True)
@@ -275,6 +306,27 @@ def test_analyzable_face_has_distinct_marker_and_double_click_signal(qapp):
     tree._double_clicked(tree.topLevelItem(1), 1)
     assert requested == [42]
     tree.close()
+
+
+def test_warning_label_selects_face_and_reveals_filtered_row(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "step_explorer.ui.main_window.QSettings",
+        lambda *_: QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+    )
+    source = tmp_path / "faces.step"
+    source.write_text("ISO-10303-21;DATA;#20=CARTESIAN_POINT('',(0.,0.,0.));"
+                      "#42=ADVANCED_FACE('',(),#20,.T.);ENDSEC;END-ISO-10303-21;")
+    window = MainWindow()
+    try:
+        window.open_path(str(source))
+        window.entity_filter.setText("cartesian_point")
+        assert window.tree.items_by_id[42].isHidden()
+        window.viewport.orientation_warning_clicked.emit(42, "warning")
+        assert window.entity_filter.text() == ""
+        assert window.current_id == 42
+        assert window.tree.currentItem() == window.tree.items_by_id[42]
+    finally:
+        window.close()
 
 
 def test_playback_face_request_starts_analysis_and_opens_sidebar(qapp):
