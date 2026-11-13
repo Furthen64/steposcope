@@ -1818,6 +1818,15 @@ class GeometryBuilder:
                     **self._face_metadata(entity, surface),
                 )
         if surface and surface.type_name.upper() == "CYLINDRICAL_SURFACE" and len(loops) == 1:
+            partial_strip = self._partial_cylindrical_strip_mesh(surface, loop_segments[0])
+            if partial_strip:
+                points, triangles = partial_strip
+                return Mesh(
+                    entity.entity_id, points,
+                    self._oriented_face_triangles(entity, surface, points, triangles, consistent=True),
+                    curved=True,
+                    **self._face_metadata(entity, surface),
+                )
             full_strip = self._full_cylindrical_strip_mesh(surface, loop_segments[0])
             if full_strip:
                 points, triangles = full_strip
@@ -4324,6 +4333,100 @@ class GeometryBuilder:
             triangles.extend(
                 ((index, following, count + following), (index, count + following, count + index))
             )
+        return points, tuple(triangles)
+
+    def _partial_cylindrical_strip_mesh(
+        self, surface: StepEntity, segments: list[tuple[Point3, ...]]
+    ) -> tuple[tuple[Point3, ...], tuple[tuple[int, int, int], ...]] | None:
+        """Mesh a rectangular partial cylinder trim as a structured UV strip.
+
+        STEP often splits each circular rim into several edges.  A contour
+        triangulator then sees a densely sampled polygon and can create a
+        large fan across the middle of an otherwise simple cylindrical patch.
+        Recognize the two-rim/two-generator rectangle in cylinder parameters
+        and connect matching angular samples directly on the analytic surface.
+        """
+
+        placement_id = next((_ref(arg) for arg in surface.arguments if _ref(arg) is not None), None)
+        placement = self.document.entity(placement_id or -1)
+        if not placement or placement.type_name.upper() != "AXIS2_PLACEMENT_3D":
+            return None
+        refs = [_ref(arg) for arg in placement.arguments if _ref(arg) is not None]
+        origin = self._cartesian(refs[0]) if refs else None
+        axis = self._normalized(self._direction(refs[1])) if len(refs) > 1 and self._direction(refs[1]) else None
+        x_axis = self._normalized(self._direction(refs[2])) if len(refs) > 2 and self._direction(refs[2]) else None
+        radius = next((_number(arg) for arg in surface.arguments if _number(arg) is not None), None)
+        if origin is None or axis is None or x_axis is None or radius is None or radius <= 0:
+            return None
+        x_axis = self._normalized(tuple(x_axis[i] - self._dot(x_axis, axis) * axis[i] for i in range(3)))
+        y_axis = self._normalized(self._cross(axis, x_axis)) if x_axis else None
+        if x_axis is None or y_axis is None:
+            return None
+
+        samples = [point for segment in segments for point in segment]
+        if len(samples) < 4:
+            return None
+        tolerance = max(radius, 1.0) * 1e-6
+        # The concatenated edge samples may jump at edge joins. Unwrap each
+        # segment independently, anchored to its first point in the loop copy.
+        uv: list[tuple[float, float]] = []
+        for segment in segments:
+            previous = uv[-1][0] if uv else None
+            for point in segment:
+                delta = (point.x - origin.x, point.y - origin.y, point.z - origin.z)
+                height = self._dot(delta, axis)
+                radial = tuple(delta[i] - height * axis[i] for i in range(3))
+                if abs(math.sqrt(self._dot(radial, radial)) - radius) > tolerance:
+                    return None
+                angle = math.atan2(self._dot(radial, y_axis), self._dot(radial, x_axis))
+                if previous is not None:
+                    angle += 2 * math.pi * round((previous - angle) / (2 * math.pi))
+                uv.append((angle, height))
+                previous = angle
+
+        angles = [item[0] for item in uv]
+        heights = [item[1] for item in uv]
+        u_min, u_max = min(angles), max(angles)
+        h_min, h_max = min(heights), max(heights)
+        angle_tolerance = 1e-7
+        height_tolerance = tolerance
+        if (u_max - u_min <= angle_tolerance or u_max - u_min >= 2 * math.pi - angle_tolerance
+                or h_max - h_min <= height_tolerance):
+            return None
+        for angle, height in uv:
+            if min(abs(angle - u_min), abs(angle - u_max), abs(height - h_min), abs(height - h_max)) > max(
+                angle_tolerance, height_tolerance
+            ):
+                return None
+        if not all(any(abs(angle - bound) <= angle_tolerance and abs(height - level) <= height_tolerance
+                       for angle, height in uv)
+                   for bound in (u_min, u_max) for level in (h_min, h_max)):
+            return None
+
+        rim_angles = sorted({angle for angle, height in uv
+                             if min(abs(height - h_min), abs(height - h_max)) <= height_tolerance})
+        # Deduplicate coincident samples contributed by adjacent STEP edges.
+        unique_angles: list[float] = []
+        for angle in rim_angles:
+            if not unique_angles or angle - unique_angles[-1] > angle_tolerance:
+                unique_angles.append(angle)
+        if len(unique_angles) < 2 or abs(unique_angles[0] - u_min) > angle_tolerance or abs(unique_angles[-1] - u_max) > angle_tolerance:
+            return None
+
+        def point(angle: float, height: float) -> Point3:
+            return Point3(*(
+                getattr(origin, coord) + height * axis[i]
+                + radius * (math.cos(angle) * x_axis[i] + math.sin(angle) * y_axis[i])
+                for i, coord in enumerate(("x", "y", "z"))
+            ))
+
+        count = len(unique_angles)
+        points = tuple(point(angle, height) for height in (h_min, h_max) for angle in unique_angles)
+        triangles = []
+        for index in range(count - 1):
+            following = index + 1
+            triangles.extend(((index, following, count + following),
+                              (index, count + following, count + index)))
         return points, tuple(triangles)
 
     def _full_cylindrical_strip_mesh(
