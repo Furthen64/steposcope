@@ -57,6 +57,16 @@ def test_box_report_flags_the_flipped_face(tmp_path):
     json.dumps(report)
 
 
+def test_open_shell_keeps_winding_flags_for_remaining_faces(tmp_path):
+    document = parse_step(_box_source())
+    meshes = list(GeometryBuilder(document).build().faces)
+    report = build_report(tmp_path / "open.step", document, meshes[:-1])
+    solid = report["solids"][0]
+    assert solid["verdict"] == "open"
+    assert solid["n_boundary_edges"] > 0
+    assert all(face["ok"] for face in solid["faces"])
+
+
 def test_far_from_origin_box_is_consistent(tmp_path):
     source = _box_source(low=50, high=70)
     document = parse_step(source)

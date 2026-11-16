@@ -405,9 +405,6 @@ def build_report(source: Path, document: StepDocument, meshes: list[Mesh]) -> di
             verdict = "inconsistent"
         else:
             verdict = "consistent"
-        if verdict != "consistent":
-            for face in faces:
-                face["ok"] = False if verdict in {"open", "unreliable"} or not global_sign_ok else face["ok"]
         solids.append({
             "shell_entity_id": shell.entity_id if shell else None,
             "faces": faces, "total_signed_volume": total,
