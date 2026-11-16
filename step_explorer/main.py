@@ -286,7 +286,9 @@ def _render_main(argv: list[str]) -> int:
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if errors:
         return 2
-    return 1 if any(solid["verdict"] != "consistent" for report in reports for solid in report["solids"]) else 0
+    # "mesh-open" (B-rep solid, tessellation T-junctions only) passes: the
+    # verdict layers separate a genuinely open shell from sampling jitter.
+    return 1 if any(solid["verdict"] in {"open", "inconsistent", "unreliable"} for report in reports for solid in report["solids"]) else 0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from step_explorer.headless import _add_face_labels, _face_color, _face_label_position, build_report, process_file, render_png
+from step_explorer.headless import _add_face_labels, _brep_topology_judgement, _face_color, _face_label_position, build_report, process_file, render_png
 from step_explorer.geometry.builder import GeometryBuilder, Mesh, Point3
 from step_explorer.main import _render_main
 from step_explorer.step.parser import parse_step
@@ -65,6 +65,21 @@ def test_open_shell_keeps_winding_flags_for_remaining_faces(tmp_path):
     assert solid["verdict"] == "open"
     assert solid["n_boundary_edges"] > 0
     assert all(face["ok"] for face in solid["faces"])
+
+
+def test_brep_keeps_distinct_vertices_on_the_same_ray():
+    document = parse_step("""ISO-10303-21;DATA;
+    #1=CARTESIAN_POINT('',(1.,0.,0.));
+    #2=CARTESIAN_POINT('',(2.,0.,0.));
+    #3=VERTEX_POINT('',#1);
+    #4=VERTEX_POINT('',#2);
+    #5=EDGE_CURVE('',#3,#4,$,.T.);
+    #6=ORIENTED_EDGE('',*,*,#5,.T.);
+    #7=EDGE_LOOP('',(#6));
+    #8=FACE_OUTER_BOUND('',#7,.T.);
+    #9=ADVANCED_FACE('',(#8),$,.T.);
+    ENDSEC;END-ISO-10303-21;""")
+    assert _brep_topology_judgement(document, [9]) == (1, 0, 0)
 
 
 def test_far_from_origin_box_is_consistent(tmp_path):
@@ -202,11 +217,18 @@ def test_corpus_reports_are_wellformed_and_verdicts_match_their_evidence(corpus_
         json.dumps(report)
         for solid in report["solids"]:
             verdict = solid["verdict"]
-            assert verdict in {"open", "unreliable", "inconsistent", "consistent"}, (path, verdict)
+            # "mesh-open" layers separately: the B-rep is a closed solid, only
+            # the tessellation has unwelded T-junction seams.
+            assert verdict in {"open", "mesh-open", "unreliable", "inconsistent", "consistent"}, (path, verdict)
             if verdict == "consistent":
                 assert solid["n_boundary_edges"] == 0, path
                 assert solid["bad_edges"] == [], path
                 assert solid["n_inconsistent"] == 0, path
                 assert all(face["ok"] for face in solid["faces"]), path
+            # "open" from a B-rep defect can coexist with a fully welded
+            # mesh, so only the mesh-open direction of this implication holds.
+            if verdict == "mesh-open":
+                assert solid["brep_closed"] is True, path
+                assert solid["n_open_brep_edges"] == 0, path
             if solid["n_boundary_edges"]:
-                assert verdict == "open", path
+                assert verdict in {"open", "mesh-open"}, path

@@ -286,6 +286,166 @@ def _mean_normal(mesh: Mesh) -> list[float]:
     return [value / length for value in vector] if length > 1e-15 else [0.0, 0.0, 0.0]
 
 
+def _brep_topology_judgement(document: StepDocument, face_ids: list[int]) -> tuple[int, int, int]:
+    """Judge shell closedness at the B-rep layer, independent of tessellation.
+
+    Walks each face's bounds -> EDGE_LOOP -> ORIENTED_EDGE chain and pairs edge
+    uses by welded vertex coordinates: a use counts as the same topological edge
+    as its neighbour when the two endpoints land on identical positions, so
+    duplicated VERTEX_POINT entities (which a CAD kernel's sewing step heals)
+    still pair. Returns (unpaired uses, same-direction pairs, unresolved uses).
+
+    Coincident edges can have multiple uses, so pair their directions by
+    balance rather than assuming exactly two uses per coordinate pair.
+    """
+
+    positions: dict[int, tuple[float, float, float]] = {}
+
+    def vertex_key(vertex_id: int) -> tuple[int, int, int] | None:
+        """Welded key of a VERTEX_POINT's position, or None when unresolvable."""
+
+        if vertex_id in positions:
+            coords = positions[vertex_id]
+        else:
+            vertex = document.entity(vertex_id)
+            if not vertex:
+                return None
+            point_ref = next(
+                (arg.entity_id for arg in vertex.arguments if isinstance(arg, StepReference)),
+                None,
+            )
+            point = document.entity(point_ref or -1)
+            aggregate = next(
+                (arg for arg in (point.arguments if point else ()) if isinstance(arg, StepAggregate)),
+                None,
+            )
+            try:
+                coords = tuple(float(value.value) for value in aggregate.values)  # type: ignore[union-attr]
+            except (AttributeError, TypeError, ValueError):
+                return None
+            positions[vertex_id] = coords
+        if len(coords) != 3:
+            return None
+        return coords  # type: ignore[return-value]
+
+    directed_uses = []
+    unresolved = 0
+    for face_id in face_ids:
+        face = document.entity(face_id)
+        candidate_refs = [
+            value.entity_id
+            for arg in (face.arguments if face else ())
+            if isinstance(arg, StepAggregate)
+            for value in arg.values
+            if isinstance(value, StepReference)
+        ] + [
+            arg.entity_id
+            for arg in (face.arguments if face else ())
+            if isinstance(arg, StepReference)
+        ]
+        bound_refs = []
+        for arg in candidate_refs:
+            bound_entity = document.entity(arg)
+            if bound_entity and bound_entity.type_name.upper() in {"FACE_OUTER_BOUND", "FACE_BOUND"}:
+                bound_refs.append(arg)
+        for bound_ref in bound_refs:
+            bound = document.entity(bound_ref)
+            if not bound or bound.type_name.upper() not in {"FACE_OUTER_BOUND", "FACE_BOUND"}:
+                unresolved += 1
+                continue
+            bound_forward = next(
+                (arg.value.upper() != "F" for arg in reversed(bound.arguments)
+                 if isinstance(arg, StepEnumeration)),
+                True,
+            )
+            loop_ref = next(
+                (arg.entity_id for arg in bound.arguments if isinstance(arg, StepReference)),
+                None,
+            )
+            loop = document.entity(loop_ref or -1)
+            if not loop or loop.type_name.upper() != "EDGE_LOOP":
+                unresolved += 1
+                continue
+            edge_refs = [
+                value.entity_id
+                for arg in loop.arguments
+                if isinstance(arg, StepAggregate)
+                for value in arg.values
+                if isinstance(value, StepReference)
+            ]
+            for edge_ref in edge_refs:
+                use = document.entity(edge_ref)
+                if not use:
+                    unresolved += 1
+                    continue
+                use_type = use.type_name.upper()
+                if use_type == "ORIENTED_EDGE":
+                    forward = next(
+                        (arg.value.upper() != "F" for arg in reversed(use.arguments)
+                         if isinstance(arg, StepEnumeration)),
+                        True,
+                    )
+                    # The edge reference, by type -- ORIENTED_EDGE also carries a
+                    # start-vertex reference, so the first StepReference arg is
+                    # not necessarily the edge.
+                    edge_id = None
+                    for arg in use.arguments:
+                        if isinstance(arg, StepReference):
+                            candidate = document.entity(arg.entity_id)
+                            if candidate and candidate.type_name.upper() in {"EDGE", "EDGE_CURVE"}:
+                                edge_id = arg.entity_id
+                                break
+                elif use_type in {"EDGE", "EDGE_CURVE"}:
+                    forward, edge_id = True, edge_ref
+                else:
+                    unresolved += 1
+                    continue
+                if edge_id is None:
+                    unresolved += 1
+                    continue
+                edge = document.entity(edge_id or -1)
+                vertices = [
+                    arg.entity_id
+                    for arg in (edge.arguments if edge else ())
+                    if isinstance(arg, StepReference)
+                ]
+                if len(vertices) < 2:
+                    unresolved += 1
+                    continue
+                first, second = (vertex_key(vertices[0]), vertex_key(vertices[1]))
+                if first is None or second is None:
+                    unresolved += 1
+                    continue
+                directed = (first, second) if forward else (second, first)
+                if not bound_forward:
+                    directed = (directed[1], directed[0])
+                directed_uses.append(directed)
+
+    extent = max((abs(value) for edge in directed_uses for point in edge for value in point), default=1.0)
+    tolerance = max(extent * 1e-9, 1e-10)
+    uses = defaultdict(list)
+    for first, second in directed_uses:
+        k1 = tuple(round(value / tolerance) for value in first)
+        k2 = tuple(round(value / tolerance) for value in second)
+        if k1 == k2:
+            # Apex and seam-point edges have no meaningful direction.
+            continue
+        directed = (k1, k2)
+        uses[tuple(sorted(directed))].append(directed)
+
+    # Pair by direction balance, not raw use count: coincident-but-distinct
+    # edges (degenerate slits where one loop traverses both copies) merge into
+    # one undirected key, so only a forward/backward imbalance is a real rim.
+    n_open_uses = 0
+    n_same_direction = 0
+    for key, incidents in uses.items():
+        forward_count = sum(1 for directed in incidents if directed == key)
+        backward_count = len(incidents) - forward_count
+        n_open_uses += abs(forward_count - backward_count)
+        n_same_direction += abs(forward_count - backward_count) // 2
+    return n_open_uses, n_same_direction, unresolved
+
+
 def _edge_judgement(meshes: list[Mesh]) -> tuple[int, list[list[int]], set[int]]:
     """Return open-edge count, equally wound triangle pairs, and their faces.
 
@@ -374,6 +534,12 @@ def build_report(source: Path, document: StepDocument, meshes: list[Mesh]) -> di
         scale = max((abs(value) for value in contributions.values()), default=1.0)
         eps = max(1e-12, scale * 1e-10)
         n_boundary_edges, bad_edges, bad_faces = _edge_judgement(shell_meshes)
+        # Same scope as the mesh judgement: a face present in the B-rep but with
+        # no mesh (tessellator coverage gap) shows up as unpaired edges on its
+        # neighbours, which is the pre-existing "open" signal for that case.
+        n_open_brep, n_same_dir_brep, n_unresolved_brep = _brep_topology_judgement(
+            document, [mesh.entity_id for mesh in shell_meshes]
+        )
         global_sign_ok = total > eps
         faces = []
         for entity_id in ids:
@@ -397,8 +563,20 @@ def build_report(source: Path, document: StepDocument, meshes: list[Mesh]) -> di
                 "ok": entity_id not in bad_faces,
             })
         coverage_ok = all(face["sense_applied"] is True for face in faces)
-        if n_boundary_edges:
+        brep_closed = n_open_brep == 0 and n_same_dir_brep == 0
+        # Two independent layers, reported separately:
+        #   B-rep layer -- does the topology itself form a closed, orientable
+        #     shell (what a CAD kernel sews into a "Solid")?
+        #   mesh layer -- do the per-face tessellations weld into one watertight
+        #     triangle soup? T-junctions here are sampling artifacts, not gaps.
+        # Precedence mirrors the original single-layer order (boundary first),
+        # with the B-rep defect checked ahead of everything: a broken B-rep is
+        # the only "open" a downstream sew step cannot heal away.
+        if n_open_brep or n_same_dir_brep:
             verdict = "open"
+        elif n_boundary_edges:
+            # brep_closed is guaranteed true here (the B-rep check ran first).
+            verdict = "mesh-open"
         elif not coverage_ok:
             verdict = "unreliable"
         elif bad_edges or not global_sign_ok:
@@ -411,6 +589,10 @@ def build_report(source: Path, document: StepDocument, meshes: list[Mesh]) -> di
             "n_inconsistent": sum(face["entity_id"] in bad_faces for face in faces),
             "n_boundary_edges": n_boundary_edges,
             "bad_edges": bad_edges,
+            "brep_closed": brep_closed,
+            "n_open_brep_edges": n_open_brep,
+            "n_same_direction_brep_edges": n_same_dir_brep,
+            "n_unresolved_brep_uses": n_unresolved_brep,
             "verdict": verdict,
         })
     return {"source": str(source), "solids": solids}
