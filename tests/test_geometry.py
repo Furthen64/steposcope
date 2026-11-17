@@ -11,6 +11,51 @@ from step_explorer.step.parser import parse_step
 from step_explorer.step.values import StepAggregate, StepNumber, StepReference
 
 
+def test_slotfillet2_cylinder_and_fillet_follow_their_surfaces():
+    source = Path(__file__).resolve().parents[1] / "corpus/TOUGH_stresstests/slotfillet2.step"
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    report = assess_completeness(document, snapshot)
+    assert report.face_count == report.meshed_face_count == 17
+    assert report.open_edge_count == report.unresolved_edge_count == 0
+    solid = build_report(source, document, snapshot.faces)["solids"][0]
+    assert solid["verdict"] == "consistent" and solid["n_boundary_edges"] == 0
+    faces = {face.entity_id: face for face in snapshot.faces}
+
+    def diff(a, b):
+        return (a.x - b.x, a.y - b.y, a.z - b.z)
+
+    cylinder = faces[341]
+    origin = builder._cartesian(1)
+    axis = builder._normalized(builder._direction(2))
+    for a, b, c in cylinder.triangles:
+        p, q, r = (cylinder.points[i] for i in (a, b, c))
+        normal = builder._cross(diff(q, p), diff(r, p))
+        center = tuple((getattr(p, name) + getattr(q, name) + getattr(r, name)) / 3
+                       - getattr(origin, name) for name in "xyz")
+        axial = builder._dot(center, axis)
+        radial = tuple(center[i] - axial * axis[i] for i in range(3))
+        length = math.sqrt(builder._dot(normal, normal) * builder._dot(radial, radial))
+        assert length > 0 and builder._dot(normal, radial) / length > 0.99
+
+    face = faces[585]
+    assert max(Counter(i for triangle in face.triangles for i in triangle).values()) <= 20
+    assert not any("sliver triangles" in reason or "zero-area" in reason
+                   for reason in builder.assess_face(585, face).reasons)
+    normals, edges = [], {}
+    for index, (a, b, c) in enumerate(face.triangles):
+        p, q, r = (face.points[i] for i in (a, b, c))
+        normal = builder._cross(diff(q, p), diff(r, p))
+        length = math.sqrt(builder._dot(normal, normal))
+        assert length > 0
+        normals.append(tuple(value / length for value in normal))
+        for edge in ((a, b), (b, c), (c, a)):
+            edges.setdefault(tuple(sorted(edge)), []).append(index)
+    assert all(builder._dot(normals[indices[0]], normals[indices[1]]) > 0.95
+               for indices in edges.values() if len(indices) == 2)
+
+
 def test_slotfillet_rational_and_cylindrical_faces_have_distributed_meshes():
     source = Path(__file__).resolve().parents[1] / "corpus/rational_bspline/slotfillet1.STEP"
     document = parse_step(source.read_text(encoding="utf-8"))

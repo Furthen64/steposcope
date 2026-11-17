@@ -1768,7 +1768,7 @@ class GeometryBuilder:
                 )
                 if patch is None:
                     patch = self._rational_projected_boundary_mesh(
-                        rational, loops, loop_segments,
+                        rational, loops, loop_segments, quality_mesh=not rational.self_intersect,
                     )
                 if patch is None:
                     return None
@@ -1832,7 +1832,9 @@ class GeometryBuilder:
                     **self._face_metadata(entity, surface),
                 )
         if surface and surface.type_name.upper() == "CYLINDRICAL_SURFACE" and len(loops) == 2:
-            stitched = self._stitch_closed_loops(loops[0], loops[1])
+            stitched = self._stitch_cylindrical_rings(surface, loops[0], loops[1])
+            if stitched is None:
+                stitched = self._stitch_closed_loops(loops[0], loops[1])
             if stitched is None:
                 stitched = self._stitch_unequal_closed_loops(loops[0], loops[1])
             if stitched:
@@ -2152,6 +2154,73 @@ class GeometryBuilder:
         return _RationalSplineSurface(
             controls, tuple(tuple(1.0 for _ in row) for row in controls), degrees, tuple(knots),
         )
+
+    def _stitch_cylindrical_rings(self, surface, first, second):
+        """Join full-turn cylinder rims in angular order, retaining their samples."""
+        placement_id = next((_ref(arg) for arg in surface.arguments if _ref(arg) is not None), None)
+        placement = self.document.entity(placement_id or -1)
+        if not placement or placement.type_name.upper() != "AXIS2_PLACEMENT_3D":
+            return None
+        refs = [_ref(arg) for arg in placement.arguments if _ref(arg) is not None]
+        origin = self._cartesian(refs[0]) if refs else None
+        axis = self._normalized(self._direction(refs[1])) if len(refs) > 1 and self._direction(refs[1]) else None
+        x_axis = self._normalized(self._direction(refs[2])) if len(refs) > 2 and self._direction(refs[2]) else None
+        radius = next((_number(arg) for arg in surface.arguments if _number(arg) is not None), None)
+        if (origin is None or axis is None or x_axis is None or radius is None or radius <= 0
+                or min(len(first), len(second)) < 3):
+            return None
+        x_axis = self._normalized(tuple(x_axis[i] - self._dot(x_axis, axis) * axis[i] for i in range(3)))
+        y_axis = self._normalized(self._cross(axis, x_axis)) if x_axis else None
+        if y_axis is None:
+            return None
+        def angles(ring):
+            values = []
+            for point in ring:
+                delta = (point.x - origin.x, point.y - origin.y, point.z - origin.z)
+                height = self._dot(delta, axis)
+                radial = tuple(delta[i] - height * axis[i] for i in range(3))
+                if abs(math.sqrt(self._dot(radial, radial)) - radius) > max(radius * 5e-4, 1e-6):
+                    return None
+                values.append(math.atan2(self._dot(delta, y_axis), self._dot(delta, x_axis)) % (2 * math.pi))
+            steps = [((b - a + math.pi) % (2 * math.pi)) - math.pi
+                     for a, b in zip(values, values[1:] + values[:1])]
+            if abs(abs(sum(steps)) - 2 * math.pi) > 1e-5:
+                return None
+            direction = 1 if sum(steps) > 0 else -1
+            if any(direction * step <= 1e-10 or abs(step) >= math.pi for step in steps):
+                return None
+            return sorted(range(len(ring)), key=values.__getitem__), values
+        a_data, b_data = angles(first), angles(second)
+        if a_data is None or b_data is None:
+            return None
+        a_order, a_angles = a_data
+        b_order, b_angles = b_data
+        start = a_angles[a_order[0]]
+        # Rotate each ring to the first sample at or after the first A angle.
+        b_split = next((i for i, index in enumerate(b_order) if b_angles[index] >= start), len(b_order))
+        b_order = b_order[b_split:] + b_order[:b_split]
+        def events(order, values):
+            return [((values[index] - start) % (2 * math.pi), index) for index in order]
+        a_events = events(a_order, a_angles)
+        b_events = events(b_order, b_angles)
+        a, b = a_order[0], b_order[-1]
+        i, j = 1, 0
+        triangles = []
+        offset = len(first)
+        while i <= len(a_order) or j < len(b_order):
+            next_a = a_events[i][0] if i < len(a_order) else (2 * math.pi if i == len(a_order) else math.inf)
+            next_b = b_events[j][0] if j < len(b_order) else math.inf
+            if next_a <= next_b:
+                following = a_order[i % len(a_order)]
+                triangles.append((a, following, offset + b))
+                a = following
+                i += 1
+            else:
+                following = b_order[j]
+                triangles.append((a, offset + following, offset + b))
+                b = following
+                j += 1
+        return tuple(first + second), tuple(triangles)
 
     def _stitch_unequal_closed_loops(
         self, first: list[Point3], second: list[Point3]
@@ -3927,7 +3996,7 @@ class GeometryBuilder:
                 parameter = Point3((xmin + x * scale) / radius, ymin + y * scale, 0)
                 points.append(surface_point(parameter))
         # Lawson edge flips reduce thin fans without changing the contour.
-        for _ in range(40):
+        for _ in range(200):
             edges = {}
             for index, (a, b, c) in enumerate(faces):
                 for p, q, other in ((a, b, c), (b, c, a), (c, a, b)):
