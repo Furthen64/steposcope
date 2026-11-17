@@ -1063,6 +1063,32 @@ class GeometryBuilder:
             if not span:
                 return ()
             result.extend(span if not result else span[1:])
+        # Fitted STEP curves can contain tiny reversals between adjacent knot
+        # spans. Remove deviations well below the sampling tolerance so they
+        # do not make an otherwise valid face trim cross itself. Simplifying
+        # the edge here keeps the same samples on both adjacent faces.
+        def simplify(points, limit):
+            keep = {0, len(points) - 1}
+            pending = [(0, len(points) - 1)]
+            while pending:
+                first, last = pending.pop()
+                a, b = points[first], points[last]
+                direction = (b.x - a.x, b.y - a.y, b.z - a.z)
+                length2 = self._dot(direction, direction)
+                greatest, selected = 0.0, None
+                for i in range(first + 1, last):
+                    p = points[i]
+                    delta = (p.x - a.x, p.y - a.y, p.z - a.z)
+                    t = max(0.0, min(1.0, self._dot(delta, direction) / length2)) if length2 else 0.0
+                    error = sum((delta[j] - t * direction[j]) ** 2 for j in range(3))
+                    if error > greatest:
+                        greatest, selected = error, i
+                if selected is not None and greatest > limit * limit:
+                    keep.add(selected)
+                    pending.extend(((first, selected), (selected, last)))
+            return [points[i] for i in sorted(keep)]
+
+        result = simplify(result, tolerance * 0.05)
         return tuple(result if forward else reversed(result))
 
     def _circle_arc(
@@ -2487,6 +2513,29 @@ class GeometryBuilder:
         ):
             return None
         uv_loop = [Point3(u, v, 0.0) for u, v in parameters]
+        if not surface.self_intersect:
+            quality = self._spline_delaunay_mesh(surface, boundary, uv_loop)
+            if quality is not None:
+                return quality
+            # Long trim segments can defeat VTK's constraint recovery. Start
+            # with the intact contour and insert/flip interior edges instead.
+            contour = self._ear_clip_loop(uv_loop)
+            if contour is not None:
+                xmin, xmax = min(p.x for p in uv_loop), max(p.x for p in uv_loop)
+                ymin, ymax = min(p.y for p in uv_loop), max(p.y for p in uv_loop)
+                width = self._distance(surface.evaluate(xmin, (ymin + ymax) / 2),
+                                       surface.evaluate(xmax, (ymin + ymax) / 2))
+                height = self._distance(surface.evaluate((xmin + xmax) / 2, ymin),
+                                        surface.evaluate((xmin + xmax) / 2, ymax))
+                if min(width, height, xmax - xmin, ymax - ymin) > 1e-10:
+                    sx, sy = width / (xmax - xmin), height / (ymax - ymin)
+                    scaled = tuple(Point3((p.x - xmin) * sx, (p.y - ymin) * sy, 0) for p in uv_loop)
+                    quality = self._improve_trim_mesh(
+                        scaled, contour[1], tuple(boundary), [scaled], 1.0,
+                        lambda p: surface.evaluate(p.x / sx + xmin, p.y / sy + ymin),
+                    )
+                    if quality is not None:
+                        return quality
         dense_rail_mesh = self._rational_dense_rail_mesh(
             surface, tuple(boundary), parameters, loop_segments[0],
         )
@@ -3804,6 +3853,15 @@ class GeometryBuilder:
                for loop in uv_loops):
             return self._periodic_cylindrical_trim_mesh(uv_loops, points, surface_point)
 
+        if len(uv_loops) == 1:
+            class CylinderSurface:
+                def evaluate(self, u, v):
+                    return surface_point(Point3(u, v, 0.0))
+
+            quality = self._spline_delaunay_mesh(CylinderSurface(), loops[0], uv_loops[0])
+            if quality is not None:
+                return quality
+
         triangulated = self._ear_clip_loop(uv_loops[0]) if len(uv_loops) == 1 else None
         if triangulated is None:
             triangulated = self._triangulate_loops(uv_loops)
@@ -3811,10 +3869,9 @@ class GeometryBuilder:
             return None
         uv_points, triangles = triangulated
         triangles = self._consistent_uv_winding(uv_points, triangles)
-        if len(uv_loops) > 1:
-            improved = self._improve_trim_mesh(uv_points, triangles, points, uv_loops, radius, surface_point)
-            if improved is not None:
-                return improved
+        improved = self._improve_trim_mesh(uv_points, triangles, points, uv_loops, radius, surface_point)
+        if improved is not None:
+            return improved
         # Keep the original STEP trim samples on shared edges.  They are
         # already within tolerance of the cylinder; projecting them here
         # would make adjacent faces disagree along a shared B-spline edge.

@@ -11,6 +11,56 @@ from step_explorer.step.parser import parse_step
 from step_explorer.step.values import StepAggregate, StepNumber, StepReference
 
 
+def test_slotfillet_rational_and_cylindrical_faces_have_distributed_meshes():
+    source = Path(__file__).resolve().parents[1] / "corpus/rational_bspline/slotfillet1.STEP"
+    document = parse_step(source.read_text(encoding="utf-8"))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    report = assess_completeness(document, snapshot)
+    assert report.face_count == report.meshed_face_count == 22
+    assert report.open_edge_count == report.unresolved_edge_count == 0
+    faces = {face.entity_id: face for face in snapshot.faces}
+    for face_id in (126, 174, 476, 922):
+        face = faces[face_id]
+        incidence = Counter(tuple(sorted(edge)) for triangle in face.triangles
+                            for edge in zip(triangle, (triangle[1], triangle[2], triangle[0])))
+        assert all(count <= 2 for count in incidence.values())
+        assert not any("sliver triangles" in reason or "zero-area" in reason
+                       for reason in builder.assess_face(face_id, face).reasons)
+    assert max(Counter(i for triangle in faces[174].triangles for i in triangle).values()) <= 12
+    face = faces[476]
+    assert max(Counter(i for triangle in face.triangles for i in triangle).values()) <= 25
+    surface = builder._rational_spline_surface(document.entity(446))
+    uv = [surface.project(point)[1:] for point in face.points]
+    du = (surface.u_range[1] - surface.u_range[0]) * 1e-5
+    dv = (surface.v_range[1] - surface.v_range[0]) * 1e-5
+    def diff(x, y):
+        return (x.x - y.x, x.y - y.y, x.z - y.z)
+    for a, b, c in face.triangles:
+        u = sum(uv[i][0] for i in (a, b, c)) / 3
+        v = sum(uv[i][1] for i in (a, b, c)) / 3
+        p, q, r = (face.points[i] for i in (a, b, c))
+        normal = builder._cross(diff(q, p), diff(r, p))
+        tangent_u = diff(surface.evaluate(u + du, v), surface.evaluate(u - du, v))
+        tangent_v = diff(surface.evaluate(u, v + dv), surface.evaluate(u, v - dv))
+        expected = builder._cross(tangent_u, tangent_v)
+        length = math.sqrt(builder._dot(normal, normal) * builder._dot(expected, expected))
+        assert length > 0 and builder._dot(normal, expected) / length > 0.95
+    face = faces[126]
+    assert max(Counter(i for triangle in face.triangles for i in triangle).values()) <= 25
+    origin = builder._cartesian(791)
+    axis = builder._normalized(builder._direction(577))
+    for a, b, c in face.triangles:
+        p, q, r = (face.points[i] for i in (a, b, c))
+        normal = builder._cross(diff(q, p), diff(r, p))
+        center = tuple((getattr(p, name) + getattr(q, name) + getattr(r, name)) / 3
+                       - getattr(origin, name) for name in "xyz")
+        axial = builder._dot(center, axis)
+        radial = tuple(center[i] - axial * axis[i] for i in range(3))
+        length = math.sqrt(builder._dot(normal, normal) * builder._dot(radial, radial))
+        assert length > 0 and builder._dot(normal, radial) / length > 0.99
+
+
 def test_helgear_trimmed_spline_edges_and_tilted_circle_axes_are_meshed():
     source = Path(__file__).resolve().parents[1] / "corpus/TOUGH_stresstests/helgear2_44kb.step"
     document = parse_step(source.read_text(encoding="utf-8"))
