@@ -4343,6 +4343,21 @@ class GeometryBuilder:
 
         if not refine:
             return points, triangles
+        if len(uv_loops) == 1:
+            class ConeSurface:
+                def evaluate(self, u, v):
+                    return surface_point(Point3(u, v, 0.0))
+
+            quality = self._spline_delaunay_mesh(ConeSurface(), loops[0], uv_loops[0])
+            if quality is not None:
+                return quality
+            mean_axial = sum(p.y for p in uv_points) / len(uv_points)
+            local_radius = abs(reference_radius + mean_axial * tangent)
+            quality = self._improve_trim_mesh(
+                uv_points, triangles, points, uv_loops, local_radius, surface_point,
+            ) if local_radius > 1e-12 else None
+            if quality is not None:
+                return quality
         return self._refine_curved_trim_mesh(
             points, uv_points, triangles, [len(loop) for loop in loops],
             surface_point, max(scale * 0.18, 1e-6),

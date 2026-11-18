@@ -669,6 +669,24 @@ def test_ellipse_edge_is_sampled_as_an_arc():
     assert max(point.y for point in edge.points) == 1.0
 
 
+def test_pockwheel_conical_face_has_consistent_normals():
+    source = Path(__file__).resolve().parents[1] / 'corpus/TOUGH_stresstests/pockwheel3.STEP'
+    builder = GeometryBuilder(parse_step(source.read_text(encoding='utf-8')), heal_orientations=False)
+    face = next(face for face in builder.build().faces if face.entity_id == 1280)
+    assert face.orientation_warning is None
+    assert not any('sliver triangles' in reason for reason in builder.assess_face(1280, face).reasons)
+    origin = builder._cartesian(628)
+    axis = builder._normalized(builder._direction(1489))
+    for a, b, c in face.triangles:
+        p, q, r = (face.points[i] for i in (a, b, c))
+        normal = builder._cross((q.x-p.x, q.y-p.y, q.z-p.z), (r.x-p.x, r.y-p.y, r.z-p.z))
+        delta = tuple(sum(getattr(point, coord) for point in (p, q, r)) / 3 - getattr(origin, coord)
+                      for coord in ('x', 'y', 'z'))
+        axial = builder._dot(delta, axis)
+        radial = builder._normalized(tuple(delta[i] - axial * axis[i] for i in range(3)))
+        assert builder._dot(normal, tuple(radial[i] - axis[i] for i in range(3))) > 0
+
+
 def test_pockwheel_irregular_toroidal_trims_are_meshed():
     source = Path(__file__).resolve().parents[1] / 'corpus/TOUGH_stresstests/pockwheel3.STEP'
     document = parse_step(source.read_text(encoding='utf-8'))
