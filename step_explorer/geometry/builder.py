@@ -1870,7 +1870,7 @@ class GeometryBuilder:
                 points, triangles = toroidal_patch
                 return Mesh(
                     entity.entity_id, points,
-                    self._oriented_face_triangles(entity, surface, points, triangles),
+                    self._oriented_face_triangles(entity, surface, points, triangles, consistent=True),
                     curved=True,
                     **self._face_metadata(entity, surface),
                 )
@@ -3723,14 +3723,14 @@ class GeometryBuilder:
     def _toroidal_patch_mesh(
         self, surface: StepEntity, loop: list[Point3]
     ) -> tuple[tuple[Point3, ...], tuple[tuple[int, int, int], ...]] | None:
-        """Tessellate a rectangular patch of a toroidal surface.
+        """Tessellate a bounded patch of a toroidal surface.
 
         A constant-radius fillet is normally represented as a torus trimmed by
         four circular arcs.  Its boundary is non-planar, so a contour
         triangulator can only make a projected, folded approximation and may
         omit much of the face.  Recognise the common four-sided parameter-space
-        rectangle and sample the torus itself instead.  Other trim topologies
-        deliberately retain the generic fallback below.
+        rectangle and sample the torus itself instead. Irregular non-winding
+        trims are triangulated in the unwrapped parameter plane.
         """
 
         numbers = [_number(argument) for argument in surface.arguments if _number(argument) is not None]
@@ -3782,7 +3782,8 @@ class GeometryBuilder:
         parameters_by_point = [parameters(point) for point in loop]
         if len(parameters_by_point) < 4:
             return None
-        surface_tolerance = max(abs(major_radius), abs(minor_radius), 1.0) * 1e-6
+        # Trim curves can be spline approximations of the analytic intersection.
+        surface_tolerance = max(abs(major_radius), abs(minor_radius), 1.0) * 2e-4
         if any(abs(radius - minor_radius) > surface_tolerance for _, _, radius in parameters_by_point):
             return None
         u_start, u_end = interval([value[0] for value in parameters_by_point])
@@ -3798,10 +3799,58 @@ class GeometryBuilder:
         # rounded or otherwise irregular torus trim from being expanded into
         # its enclosing rectangle.
         tolerance = 1e-6
+        rectangular = True
         for u, v, _ in parameters_by_point:
             u, v = unwrap(u, u_start), unwrap(v, v_start)
             if min(abs(u - u_start), abs(u - u_end), abs(v - v_start), abs(v - v_end)) > tolerance:
+                rectangular = False
+                break
+
+        if not rectangular:
+            # Unwrap both periodic coordinates along the boundary.  Reject
+            # loops that wind around a seam: they need an explicit seam cut.
+            uv = [Point3(parameters_by_point[0][0], parameters_by_point[0][1], 0.0)]
+            for u, v, _ in parameters_by_point[1:]:
+                previous = uv[-1]
+                uv.append(Point3(previous.x + (u - previous.x + math.pi) % (2 * math.pi) - math.pi,
+                                 previous.y + (v - previous.y + math.pi) % (2 * math.pi) - math.pi, 0.0))
+            if any(abs((getattr(uv[-1], coord) - getattr(uv[0], coord))) > math.pi for coord in ('x', 'y')):
                 return None
+            def surface_point(location):
+                radial = major_radius + minor_radius * math.cos(location.y)
+                return Point3(*(getattr(origin, coord)
+                    + radial * (math.cos(location.x) * x_axis[index] + math.sin(location.x) * y_axis[index])
+                    + minor_radius * math.sin(location.y) * axis[index]
+                    for index, coord in enumerate(('x', 'y', 'z'))))
+
+            class TorusSurface:
+                def evaluate(self, u, v):
+                    return surface_point(Point3(u, v, 0.0))
+
+            quality = self._spline_delaunay_mesh(TorusSurface(), loop, uv)
+            if quality is not None:
+                return quality
+            triangulated = self._ear_clip_loop(uv)
+            if triangulated is None:
+                return None
+            uv_points, triangles = triangulated
+            triangles = self._consistent_uv_winding(uv_points, triangles)
+            # Scale angular coordinates by their local physical lengths before
+            # improving the mesh, so the narrow torus cross-section is not
+            # treated as equal in size to the major arc.
+            mid_v = (min(p.y for p in uv) + max(p.y for p in uv)) / 2
+            u_scale = abs(major_radius + minor_radius * math.cos(mid_v))
+            scaled_uv = tuple(Point3(p.x * u_scale, p.y * minor_radius, 0.0) for p in uv_points)
+            improved = self._improve_trim_mesh(
+                scaled_uv, triangles, tuple(loop), [scaled_uv], 1.0,
+                lambda p: surface_point(Point3(p.x / u_scale, p.y / minor_radius, 0.0)),
+            ) if u_scale > 1e-12 else None
+            if improved is not None:
+                return improved
+            return self._refine_curved_trim_mesh(
+                tuple(loop), uv_points, triangles, [len(loop)], surface_point,
+                max(minor_radius * 0.25, 1e-6),
+            )
 
         u_steps = max(1, math.ceil(u_span / (math.pi / 18)))
         v_steps = max(1, math.ceil(v_span / (math.pi / 18)))

@@ -669,6 +669,31 @@ def test_ellipse_edge_is_sampled_as_an_arc():
     assert max(point.y for point in edge.points) == 1.0
 
 
+def test_pockwheel_irregular_toroidal_trims_are_meshed():
+    source = Path(__file__).resolve().parents[1] / 'corpus/TOUGH_stresstests/pockwheel3.STEP'
+    document = parse_step(source.read_text(encoding='utf-8'))
+    builder = GeometryBuilder(document)
+    snapshot = builder.build()
+    assert len(snapshot.faces) == 33
+    faces = {face.entity_id: face for face in snapshot.faces}
+    for face_id, surface_id, major, minor in ((186, 268, 120, 9.5), (398, 610, 146.5, 8)):
+        face = faces[face_id]
+        surface = document.entity(surface_id)
+        placement_id = next(arg.entity_id for arg in surface.arguments if isinstance(arg, StepReference))
+        origin, axis = _placement_frame(builder, document, placement_id)
+        for point in face.points:
+            delta = (point.x - origin.x, point.y - origin.y, point.z - origin.z)
+            axial = builder._dot(delta, axis)
+            radial = math.sqrt(max(0, builder._dot(delta, delta) - axial * axial))
+            assert math.hypot(radial - major, axial) == pytest.approx(minor, abs=0.0011)
+        incidence = Counter(tuple(sorted(edge)) for triangle in face.triangles
+                            for edge in zip(triangle, (triangle[1], triangle[2], triangle[0])))
+        assert max(incidence.values()) == 2
+        assert sum(count == 1 for count in incidence.values()) > 100
+        assert not any('sliver triangles' in reason or 'zero-area' in reason
+                       for reason in builder.assess_face(face_id, face).reasons)
+
+
 def test_toroidal_fillet_patches_are_sampled_on_their_surfaces():
     """A non-planar fillet boundary must not be flattened by contour triangulation."""
     source = """ISO-10303-21;DATA;
