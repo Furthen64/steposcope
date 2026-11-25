@@ -3919,9 +3919,10 @@ class GeometryBuilder:
             return None
 
         # STEP exporters may encode a trim curve as a B-spline approximation
-        # to an analytic cylinder.  Accept its small scale-relative residual
-        # while keeping the shared boundary samples identical across faces.
-        tolerance = max(abs(radius) * 5e-4, 1e-6)
+        # to an analytic cylinder, including imperfect intersection curves in
+        # damaged models. Keep the shared samples, but reject trims that are
+        # too far from the surface to provide a useful preview.
+        tolerance = max(abs(radius) * 0.02, 1e-6)
         uv_loops: list[list[Point3]] = []
         for loop in loops:
             if len(loop) < 3:
@@ -4283,7 +4284,9 @@ class GeometryBuilder:
                 scale,
                 *(self._distance(origin, point) for point in loop),
             )
-        tolerance = max(scale * 2e-4, 1e-6)
+        # Intersection splines in damaged files can deviate slightly from the
+        # cone. Preserve the common edge samples within a bounded tolerance.
+        tolerance = max(scale * 0.001, 1e-6)
         uv_loops: list[list[Point3]] = []
         for loop in loops:
             if len(loop) < 3:

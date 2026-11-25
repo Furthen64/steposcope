@@ -687,6 +687,38 @@ def test_pockwheel_conical_face_has_consistent_normals():
         assert builder._dot(normal, tuple(radial[i] - axis[i] for i in range(3))) > 0
 
 
+def test_cylindrical_trim_accepts_small_boundary_residual_but_rejects_large_one():
+    document = parse_step("""ISO-10303-21;DATA;
+    #1=CARTESIAN_POINT('',(0.,0.,0.));
+    #2=DIRECTION('',(0.,0.,1.)); #3=DIRECTION('',(1.,0.,0.));
+    #4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+    #5=CYLINDRICAL_SURFACE('',#4,10.);
+    ENDSEC;END-ISO-10303-21;""")
+    builder = GeometryBuilder(document)
+    surface = document.entity(5)
+
+    def boundary(offset):
+        return [Point3((10 + offset) * math.cos(angle),
+                       (10 + offset) * math.sin(angle), height)
+                for angle, height in ((0, 0), (0.5, 0), (0.5, 4), (0, 4))]
+
+    loop = boundary(0.15)
+    mesh = builder._cylindrical_trim_mesh(surface, [loop])
+    assert mesh is not None
+    assert all(point in mesh[0] for point in loop)
+    assert builder._cylindrical_trim_mesh(surface, [boundary(0.3)]) is None
+
+
+def test_broken_pockwheel_previews_approximate_analytic_trims():
+    source = Path(__file__).resolve().parents[1] / 'corpus/TOUGH_stresstests/pockwheel3_broken.step'
+    if not source.exists():
+        pytest.skip('optional broken pockwheel corpus file is unavailable')
+    document = parse_step(source.read_text(encoding='utf-8'))
+    faces = {face.entity_id: face for face in GeometryBuilder(document).build().faces}
+    for face_id in (673, 809, 1319, 2059, 2118, 2272):
+        assert faces[face_id].triangles
+
+
 def test_pockwheel_irregular_toroidal_trims_are_meshed():
     source = Path(__file__).resolve().parents[1] / 'corpus/TOUGH_stresstests/pockwheel3.STEP'
     document = parse_step(source.read_text(encoding='utf-8'))
